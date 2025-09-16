@@ -40,19 +40,20 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
 FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
+
 # Conversation states
 (
     MAIN_MENU,
     JSON_MAKER_CHOICE, WAITING_IMAGES_OCR,
-) = range(3)
+    JSON_TRANSLATE_CHOICE, JSON_DIVIDE_CHOICE
+) = range(5)
 
-# --- NEW: Load DocTR model ---
+# --- Load DocTR model ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Loading DocTR OCR model onto {DEVICE}...")
 try:
     from doctr.models import ocr_predictor
     from doctr.io import DocumentFile
-    # This will download the models on the first run
     model = ocr_predictor(pretrained=True)
     model.to(DEVICE)
     logger.info("DocTR OCR model loaded successfully.")
@@ -64,49 +65,31 @@ except Exception as e:
 # --- Helper & Utility Functions ---
 
 def get_ocr_results(image_paths: List[str]) -> Dict:
-    """Runs OCR on a list of images using DocTR."""
     results = {}
     try:
-        # Load images into a document object that doctr can read
         doc = DocumentFile.from_images(image_paths)
-        
-        # Run the OCR predictor
         ocr_result = model(doc)
-
-        # Process the results
         for img_path, page in zip(image_paths, ocr_result.pages):
             image_name = os.path.basename(img_path)
             height, width = page.dimensions
-            
             text_blocks = []
             for block in page.blocks:
                 for line in block.lines:
-                    # Reconstruct the full line of text
                     line_text = ' '.join([word.value for word in line.words])
-                    
-                    # Calculate the bounding box for the entire line
                     x_coords = [word.geometry[0][0] for word in line.words] + [word.geometry[1][0] for word in line.words]
                     y_coords = [word.geometry[0][1] for word in line.words] + [word.geometry[1][1] for word in line.words]
-                    
-                    # Un-normalize the coordinates
                     xmin = int(min(x_coords) * width)
                     ymin = int(min(y_coords) * height)
                     xmax = int(max(x_coords) * width)
                     ymax = int(max(y_coords) * height)
-                    
-                    text_blocks.append({
-                        "text": line_text,
-                        "location": [xmin, ymin, xmax, ymax]
-                    })
+                    text_blocks.append({"text": line_text, "location": [xmin, ymin, xmax, ymax]})
             results[image_name] = text_blocks
             logger.info(f"Successfully processed {image_name} with DocTR.")
-            
     except Exception as e:
         logger.error(f"Failed during DocTR processing: {e}")
         logger.error(traceback.format_exc())
         for image_path in image_paths:
             results[os.path.basename(image_path)] = []
-    
     return results
 
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
@@ -118,9 +101,12 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
 # --- Main Menu & Core Navigation ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Displays the full main menu."""
+    # RESTORED: All buttons are now present
     keyboard = [
         [InlineKeyboardButton("📝 Json maker", callback_data="main_json_maker")],
-        # Add other buttons here as you build them out
+        [InlineKeyboardButton("🎨 json To Comic translate", callback_data="main_translate")],
+        [InlineKeyboardButton("✂️ json divide", callback_data="main_divide")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -135,6 +121,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             logger.info("Callback query already answered.")
         if query.message.text != message_text or query.message.reply_markup != reply_markup:
             await query.edit_message_text(message_text, reply_markup=reply_markup)
+    return MAIN_MENU
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Operation cancelled.")
+    cleanup_user_data(context)
+    return ConversationHandler.END
+
+# --- Placeholder menus for WIP features ---
+async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer("This feature is a work in progress.", show_alert=True)
+    return MAIN_MENU
+    
+async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer("This feature is a work in progress.", show_alert=True)
     return MAIN_MENU
 
 # --- 1. Json Maker Feature ---
@@ -234,7 +238,10 @@ def main() -> None:
         entry_points=[CommandHandler("start", start)],
         states={
             MAIN_MENU: [
+                # RESTORED: Handlers for all buttons
                 CallbackQueryHandler(json_maker_menu, pattern="^main_json_maker$"),
+                CallbackQueryHandler(json_translate_menu, pattern="^main_translate$"),
+                CallbackQueryHandler(json_divide_menu, pattern="^main_divide$"),
                 CallbackQueryHandler(start, pattern="^main_menu_start$"), 
             ],
             JSON_MAKER_CHOICE: [
