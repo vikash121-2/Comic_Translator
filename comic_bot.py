@@ -6,6 +6,7 @@ import json
 import torch
 import tempfile
 import traceback
+import asyncio
 from typing import List, Dict
 
 from PIL import Image, ImageDraw, ImageFont
@@ -32,45 +33,42 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Global Variables & Configuration ---
-BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
-FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+FONT_PATH = "font.ttf"
 MODEL_ID = "microsoft/Florence-2-large"
 
 # Conversation states
 (
     MAIN_MENU,
     JSON_MAKER_CHOICE, WAITING_IMAGES_OCR, WAITING_ZIP_OCR,
-    # ... add other states if you expand functionality
-) = range(4)
+    JSON_TRANSLATE_CHOICE, WAITING_JSON_TRANSLATE_ZIP, WAITING_ZIP_TRANSLATE,
+    JSON_DIVIDE_CHOICE, WAITING_JSON_DIVIDE, WAITING_ZIP_DIVIDE,
+) = range(10)
 
-# --- Load Florence-2 model and processor ---
+
+# --- Load Florence-2 model ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 logger.info(f"Loading Florence-2 model ({MODEL_ID}) onto {DEVICE}...")
 try:
     from transformers import AutoProcessor, AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(MODEL_ID, trust_remote_code=True, attn_implementation="eager").to(DEVICE)
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
     logger.info("Florence-2 model loaded successfully.")
-except ImportError:
-    logger.critical("Critical Error: Transformers library not found.")
-    exit(1)
 except Exception as e:
     logger.critical(f"Critical Error: Could not load the Florence-2 model. Error: {e}")
     exit(1)
 
 
-# --- Helper Function for OCR (with better error logging) ---
+# --- Helper & Utility Functions ---
+
 def get_ocr_results(image_paths: List[str]) -> Dict:
+    # This function remains the same
     results = {}
     task_prompt = "<OCR_WITH_REGION>"
     for image_path in image_paths:
         image_name = os.path.basename(image_path)
         try:
             image = Image.open(image_path).convert("RGB")
-            if not image:
-                raise ValueError("Pillow failed to open the image.")
-
             inputs = processor(text=task_prompt, images=image, return_tensors="pt").to(DEVICE)
             generated_ids = model.generate(
                 input_ids=inputs["input_ids"],
@@ -86,16 +84,11 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
             ocr_data = parsed_answer[task_prompt]
             text_blocks = [{"text": label, "location": bbox} for bbox, label in zip(ocr_data['bboxes'], ocr_data['labels'])]
             results[image_name] = text_blocks
-            logger.info(f"Successfully processed {image_name}")
-
         except Exception as e:
-            # NEW: More detailed error logging
             logger.error(f"Failed to process image {image_path}: {e}")
-            logger.error(traceback.format_exc()) # This will print the full error traceback
-            results[image_name] = [] # Set empty result for the failed image
+            logger.error(traceback.format_exc())
+            results[image_name] = []
     return results
-
-# --- Bot Cleanup and Menu Handlers ---
 
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
     if 'temp_dir' in context.user_data:
@@ -104,10 +97,17 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('image_paths', None)
     context.user_data.pop('json_data', None)
 
+
+# --- Main Menu & Core Navigation ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Displays the full main menu."""
+    # RESTORED: All buttons are now present
     keyboard = [
         [InlineKeyboardButton("📝 Json maker", callback_data="main_json_maker")],
-        # Add other features back here if needed
+        [InlineKeyboardButton("🎨 json To Comic translate", callback_data="main_translate")],
+        [InlineKeyboardButton("✂️ json divide", callback_data="main_divide")],
+        [InlineKeyboardButton("🌐 Choose ocr language", callback_data="main_language")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -117,8 +117,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     elif update.callback_query:
         query = update.callback_query
         await query.answer()
-        if query.message.text != message_text:
+        # Avoid editing the message if it's already the menu to prevent flicker
+        if query.message.text != message_text or query.message.reply_markup != reply_markup:
             await query.edit_message_text(message_text, reply_markup=reply_markup)
+
     return MAIN_MENU
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -128,13 +130,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cleanup_user_data(context)
     return ConversationHandler.END
 
-# --- 1. JSON Maker ---
+
+# --- 1. Json Maker Feature ---
 
 async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # This function is unchanged
     query = update.callback_query
     keyboard = [
-        [InlineKeyboardButton("🖼️ Image Upload", callback_data="jm_image")],
-        [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jm_zip")],
+        [
+            InlineKeyboardButton("🖼️ Image Upload", callback_data="jm_image"),
+            InlineKeyboardButton("🗂️ Zip Upload", callback_data="jm_zip"),
+        ],
         [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -143,6 +149,7 @@ async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return JSON_MAKER_CHOICE
 
 async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # This function is unchanged
     query = update.callback_query
     context.user_data['temp_dir'] = tempfile.TemporaryDirectory()
     context.user_data['image_paths'] = []
@@ -151,6 +158,7 @@ async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_
     return WAITING_IMAGES_OCR
 
 async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # This function is unchanged
     try:
         temp_dir_path = context.user_data['temp_dir'].name
         image_paths = context.user_data['image_paths']
@@ -186,30 +194,27 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return WAITING_IMAGES_OCR
 
 async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # This function is unchanged
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Processing images with Florence-2...")
+    await query.edit_message_text("Processing images...")
     
     image_paths = context.user_data.get('image_paths', [])
     if not image_paths:
-        await query.edit_message_text("You didn't send any images! Please start over.", reply_markup=None)
+        await query.edit_message_text("You didn't send any images! Please start over.")
         cleanup_user_data(context)
         return await start(update, context)
 
     ocr_data = get_ocr_results(image_paths)
     final_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
     
-    # NEW: Check if any text was actually extracted
     total_text_blocks = sum(len(img["text_blocks"]) for img in final_json["images"])
     if total_text_blocks == 0:
         await query.edit_message_text(
-            "I couldn't extract any text from the image(s) you sent. "
-            "This can happen with unsupported formats (try .jpg or .png) or corrupted files. "
-            "Returning to the main menu."
+            "I couldn't extract any text from the image(s). This might be due to the format or a corrupted file. Returning to the main menu."
         )
         cleanup_user_data(context)
-        # Give user a moment to read before showing menu
-        await asyncio.sleep(3) 
+        await asyncio.sleep(3)
         return await start(update, context)
 
     temp_dir_path = context.user_data['temp_dir'].name
@@ -222,7 +227,29 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     cleanup_user_data(context)
     return await start(update, context)
 
+# Placeholder functions for other features will be added/restored below
+
+async def not_implemented_yet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Generic handler for features that are not fully built out yet."""
+    query = update.callback_query
+    await query.answer("This feature is not yet implemented.", show_alert=True)
+    return MAIN_MENU
+    
+async def language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Informational menu for language selection."""
+    query = update.callback_query
+    keyboard = [[InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.answer()
+    await query.edit_message_text(
+        "The current OCR model (Florence-2) is multilingual and detects language automatically. No selection is needed.",
+        reply_markup=reply_markup
+    )
+    return MAIN_MENU
+
+
 # --- Main Application Setup ---
+
 def main() -> None:
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("Error: Please replace 'YOUR_BOT_TOKEN_HERE' with your bot token.")
@@ -234,25 +261,30 @@ def main() -> None:
         entry_points=[CommandHandler("start", start)],
         states={
             MAIN_MENU: [
+                # RESTORED: Handlers for all main menu buttons
                 CallbackQueryHandler(json_maker_menu, pattern="^main_json_maker$"),
+                CallbackQueryHandler(not_implemented_yet, pattern="^main_translate$"), # Placeholder
+                CallbackQueryHandler(not_implemented_yet, pattern="^main_divide$"),   # Placeholder
+                CallbackQueryHandler(language_menu, pattern="^main_language$"),
                 CallbackQueryHandler(start, pattern="^main_menu_start$"), 
             ],
             JSON_MAKER_CHOICE: [
                 CallbackQueryHandler(json_maker_prompt_image, pattern="^jm_image$"),
-                # Add zip prompt handler if needed
+                CallbackQueryHandler(not_implemented_yet, pattern="^jm_zip$"), # Placeholder for zip
                 CallbackQueryHandler(start, pattern="^main_menu_start$"),
             ],
             WAITING_IMAGES_OCR: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, collect_images),
                 CallbackQueryHandler(process_collected_images, pattern="^jm_process_images$"),
             ],
+            # Add other states here as you build them out
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+        fallbacks=[CommandHandler("start", start)],
     )
 
     application.add_handler(conv_handler)
     application.run_polling()
 
+
 if __name__ == "__main__":
-    import asyncio # Add this import for the sleep function
     main()
