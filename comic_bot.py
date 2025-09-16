@@ -1,3 +1,5 @@
+# No special sys.path modification is needed for this version
+
 import logging
 import os
 import zipfile
@@ -45,51 +47,56 @@ FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file
 (
     MAIN_MENU,
     JSON_MAKER_CHOICE, WAITING_IMAGES_OCR,
-    JSON_TRANSLATE_CHOICE, JSON_DIVIDE_CHOICE
-) = range(5)
+) = range(3)
 
-# --- Load DocTR model ---
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"Loading DocTR OCR model onto {DEVICE}...")
+# --- NEW: Load easyocr model with correct languages and GPU support ---
+logger.info(f"Loading easyocr model...")
 try:
-    from doctr.models import ocr_predictor
-    from doctr.io import DocumentFile
-    model = ocr_predictor(pretrained=True)
-    model.to(DEVICE)
-    logger.info("DocTR OCR model loaded successfully.")
+    import easyocr
+    # This will download the models on the first run.
+    # We are using Simplified Chinese and English.
+    # gpu=True requires the Colab runtime to be set to GPU.
+    use_gpu = torch.cuda.is_available()
+    logger.info(f"GPU available: {use_gpu}")
+    reader = easyocr.Reader(['ch_sim', 'en'], gpu=use_gpu) 
+    logger.info("easyocr model loaded successfully.")
 except Exception as e:
-    logger.critical(f"Critical Error: Could not load DocTR model. Error: {e}")
+    logger.critical(f"Critical Error: Could not load easyocr model. Error: {e}")
     logger.critical(traceback.format_exc())
     exit(1)
 
 # --- Helper & Utility Functions ---
 
 def get_ocr_results(image_paths: List[str]) -> Dict:
+    """Runs OCR on a list of images using easyocr."""
     results = {}
-    try:
-        doc = DocumentFile.from_images(image_paths)
-        ocr_result = model(doc)
-        for img_path, page in zip(image_paths, ocr_result.pages):
-            image_name = os.path.basename(img_path)
-            height, width = page.dimensions
+    for image_path in image_paths:
+        image_name = os.path.basename(image_path)
+        try:
+            # easyocr reads the path directly
+            ocr_output = reader.readtext(image_path)
+            
             text_blocks = []
-            for block in page.blocks:
-                for line in block.lines:
-                    line_text = ' '.join([word.value for word in line.words])
-                    x_coords = [word.geometry[0][0] for word in line.words] + [word.geometry[1][0] for word in line.words]
-                    y_coords = [word.geometry[0][1] for word in line.words] + [word.geometry[1][1] for word in line.words]
-                    xmin = int(min(x_coords) * width)
-                    ymin = int(min(y_coords) * height)
-                    xmax = int(max(x_coords) * width)
-                    ymax = int(max(y_coords) * height)
-                    text_blocks.append({"text": line_text, "location": [xmin, ymin, xmax, ymax]})
+            for (bbox, text, prob) in ocr_output:
+                # bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                # We need to convert it to a simple [xmin, ymin, xmax, ymax]
+                x_coords = [int(p[0]) for p in bbox]
+                y_coords = [int(p[1]) for p in bbox]
+                
+                simple_bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                
+                text_blocks.append({
+                    "text": text,
+                    "location": simple_bbox
+                })
+
             results[image_name] = text_blocks
-            logger.info(f"Successfully processed {image_name} with DocTR.")
-    except Exception as e:
-        logger.error(f"Failed during DocTR processing: {e}")
-        logger.error(traceback.format_exc())
-        for image_path in image_paths:
-            results[os.path.basename(image_path)] = []
+            logger.info(f"Successfully processed {image_name} with easyocr.")
+            
+        except Exception as e:
+            logger.error(f"Failed to process image {image_path} with easyocr: {e}")
+            logger.error(traceback.format_exc())
+            results[image_name] = []
     return results
 
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
@@ -101,16 +108,13 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
 # --- Main Menu & Core Navigation ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the full main menu."""
-    # RESTORED: All buttons are now present
     keyboard = [
         [InlineKeyboardButton("📝 Json maker", callback_data="main_json_maker")],
-        [InlineKeyboardButton("🎨 json To Comic translate", callback_data="main_translate")],
-        [InlineKeyboardButton("✂️ json divide", callback_data="main_divide")],
+        # Add other buttons here as you build them out
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    message_text = "Welcome! This bot uses DocTR for OCR. Please choose an option:"
+    message_text = "Welcome! This bot uses easyocr. Please choose an option:"
     if update.message:
         await update.message.reply_text(message_text, reply_markup=reply_markup)
     elif update.callback_query:
@@ -121,24 +125,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             logger.info("Callback query already answered.")
         if query.message.text != message_text or query.message.reply_markup != reply_markup:
             await query.edit_message_text(message_text, reply_markup=reply_markup)
-    return MAIN_MENU
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Operation cancelled.")
-    cleanup_user_data(context)
-    return ConversationHandler.END
-
-# --- Placeholder menus for WIP features ---
-async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer("This feature is a work in progress.", show_alert=True)
-    return MAIN_MENU
-    
-async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer("This feature is a work in progress.", show_alert=True)
     return MAIN_MENU
 
 # --- 1. Json Maker Feature ---
@@ -200,7 +186,7 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Processing images with DocTR...")
+    await query.edit_message_text("Processing images with easyocr...")
     
     image_paths = context.user_data.get('image_paths', [])
     if not image_paths:
@@ -238,10 +224,7 @@ def main() -> None:
         entry_points=[CommandHandler("start", start)],
         states={
             MAIN_MENU: [
-                # RESTORED: Handlers for all buttons
                 CallbackQueryHandler(json_maker_menu, pattern="^main_json_maker$"),
-                CallbackQueryHandler(json_translate_menu, pattern="^main_translate$"),
-                CallbackQueryHandler(json_divide_menu, pattern="^main_divide$"),
                 CallbackQueryHandler(start, pattern="^main_menu_start$"), 
             ],
             JSON_MAKER_CHOICE: [
