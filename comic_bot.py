@@ -3,7 +3,7 @@ import os
 import zipfile
 import shutil
 import json
-import io
+import torch
 import tempfile
 from typing import List, Dict
 
@@ -25,19 +25,13 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.constants import ParseMode
 
-# --- OCR Initialization ---
-# This is a heavy import, so it's good to know it's happening at the start.
+# --- NEW: Transformers & Florence-2 OCR Initialization ---
 try:
-    from surya.ocr import run_ocr
-    from surya.model.detection import segformer
-    from surya.model.recognition import vit
-    from surya.data.transforms import letterbox
-    from surya.languages import CODE_TO_LANGUAGE
+    from transformers import AutoProcessor, AutoModelForCausalLM
 except ImportError:
-    print("Error: Surya OCR library not found.")
-    print("Please install it with: pip install surya-ocr")
+    print("Error: Transformers library not found.")
+    print("Please install it with: pip install transformers accelerate")
     exit(1)
 
 # --- Basic Setup ---
@@ -47,10 +41,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Global Variables & Configuration ---
-BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
-FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
-DEFAULT_LANG = ["en"]
-SUPPORTED_LANGS = sorted(CODE_TO_LANGUAGE.keys())
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # <-- IMPORTANT: Replace with your bot token
+FONT_PATH = "font.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
 # Conversation states
 (
@@ -62,31 +54,71 @@ SUPPORTED_LANGS = sorted(CODE_TO_LANGUAGE.keys())
     CHOOSE_LANG
 ) = range(13)
 
-# Load OCR models once to be used globally
-det_processor, det_model = segformer.load_processor_and_model()
-rec_processor, rec_model = vit.load_processor_and_model()
+# --- NEW: Load Florence-2 model and processor once globally ---
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_ID = "microsoft/Florence-2-large"
+
+logger.info(f"Loading Florence-2 model ({MODEL_ID}) onto {DEVICE}...")
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, trust_remote_code=True).to(DEVICE)
+processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+logger.info("Florence-2 model loaded successfully.")
 
 
 # --- Helper Functions ---
-def get_ocr_results(image_paths: List[str], lang: List[str]) -> Dict:
-    """Runs OCR on a list of images and returns a structured dictionary."""
-    images = [Image.open(p) for p in image_paths]
-    predictions = run_ocr(images, [lang] * len(images), det_model, det_processor, rec_model, rec_processor)
-
+def get_ocr_results(image_paths: List[str], lang: List[str] = None) -> Dict:
+    """
+    Runs OCR on a list of images using Florence-2 and returns a structured dictionary.
+    The `lang` parameter is ignored as Florence-2 is multilingual.
+    """
     results = {}
-    for i, pred in enumerate(predictions):
-        image_name = os.path.basename(image_paths[i])
-        text_blocks = []
-        for line in pred.text_lines:
-            text_blocks.append({
-                "text": line.text,
-                "location": line.bbox
-            })
-        results[image_name] = text_blocks
+    task_prompt = "<OCR_WITH_REGION>"
+
+    for image_path in image_paths:
+        try:
+            image = Image.open(image_path).convert("RGB")
+            image_name = os.path.basename(image_path)
+
+            # Prepare inputs for the model
+            inputs = processor(text=task_prompt, images=image, return_tensors="pt").to(DEVICE)
+
+            # Generate text and bounding boxes
+            generated_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                num_beams=3,
+                do_sample=False
+            )
+            
+            # Decode the generated ids
+            generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+
+            # Post-process to get structured output
+            parsed_answer = processor.post_process_generation(
+                generated_text, task=task_prompt, image_sizes=[image.size]
+            )
+
+            # Convert to the required JSON structure
+            ocr_data = parsed_answer[task_prompt]
+            text_blocks = []
+            for bbox, label in zip(ocr_data['bboxes'], ocr_data['labels']):
+                # The bbox is [xmin, ymin, xmax, ymax]
+                text_blocks.append({
+                    "text": label,
+                    "location": bbox
+                })
+            
+            results[image_name] = text_blocks
+            logger.info(f"Successfully processed {image_name}")
+
+        except Exception as e:
+            logger.error(f"Failed to process image {image_path}: {e}")
+            results[os.path.basename(image_path)] = [] # Return empty list on failure
+
     return results
 
+# --- Bot Command Handlers (No changes from here onwards, except for language handler) ---
 
-# --- Bot Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Starts the conversation and displays the main menu."""
     reply_keyboard = [
@@ -96,7 +128,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ["Choose ocr language"],
     ]
     await update.message.reply_text(
-        "Welcome! I can help you with OCR and comic translation tasks.\n\n"
+        "Welcome! I use the Florence-2 model for OCR tasks.\n\n"
         "Please choose an option:",
         reply_markup=ReplyKeyboardMarkup(
             reply_keyboard, one_time_keyboard=True, resize_keyboard=True
@@ -110,12 +142,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "Operation cancelled.", reply_markup=ReplyKeyboardRemove()
     )
+    # Clean up any stored data
+    for key in ['media_group', 'json_data']:
+        if key in context.user_data:
+            del context.user_data[key]
     return ConversationHandler.END
 
 
 # --- 1. JSON Maker ---
 async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the JSON Maker sub-menu."""
     reply_keyboard = [["image upload", "zip upload"]]
     await update.message.reply_text(
         "How would you like to provide the source files?",
@@ -124,25 +159,27 @@ async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return JSON_MAKER_CHOICE
 
 async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Asks the user to upload images for OCR."""
     await update.message.reply_text("Please send me one or more images.", reply_markup=ReplyKeyboardRemove())
     context.user_data['media_group'] = []
     return WAITING_IMAGES_OCR
 
 async def json_maker_process_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Processes uploaded images, performs OCR, and sends a JSON file."""
-    await update.message.reply_text("Processing images... This may take a moment.")
+    await update.message.reply_text("Processing images with Florence-2... This may take a moment.")
     
     with tempfile.TemporaryDirectory() as temp_dir:
         image_paths = []
-        for msg in context.user_data.get('media_group', [update.message]):
-            photo_file = await msg.photo[-1].get_file()
-            file_path = os.path.join(temp_dir, f"{photo_file.file_id}.jpg")
-            await photo_file.download_to_drive(file_path)
-            image_paths.append(file_path)
+        # Use a simplified approach for single/multiple images for robustness
+        messages = context.user_data.get('media_group', [update.message]) if 'media_group' in context.user_data and context.user_data['media_group'] else [update.message]
 
-        lang = context.user_data.get('ocr_lang', DEFAULT_LANG)
-        ocr_data = get_ocr_results(image_paths, lang)
+        for msg in messages:
+            if msg.photo:
+                photo_file = await msg.photo[-1].get_file()
+                file_path = os.path.join(temp_dir, f"{photo_file.file_id}.jpg")
+                await photo_file.download_to_drive(file_path)
+                image_paths.append(file_path)
+
+        ocr_data = get_ocr_results(image_paths)
 
         final_json = {
             "images": [
@@ -157,17 +194,15 @@ async def json_maker_process_images(update: Update, context: ContextTypes.DEFAUL
             
         await update.message.reply_document(document=open(json_path, 'rb'))
     
-    await update.message.reply_text("Done! What would you like to do next?")
     context.user_data.pop('media_group', None)
-    return await start(update, context) # Go back to main menu
+    await update.message.reply_text("Done! What would you like to do next? /start")
+    return ConversationHandler.END
 
 async def json_maker_prompt_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Asks the user to upload a zip file for OCR."""
     await update.message.reply_text("Please send me a zip file.", reply_markup=ReplyKeyboardRemove())
     return WAITING_ZIP_OCR
 
 async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Processes a zip file, performs OCR on all images, and sends a JSON file."""
     zip_file = await update.message.document.get_file()
     
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -180,7 +215,6 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
             
         await update.message.reply_text("Zip file extracted. Starting OCR on all images...")
         
-        lang = context.user_data.get('ocr_lang', DEFAULT_LANG)
         final_json = {"folders": []}
 
         for folder_name in sorted(os.listdir(extract_path)):
@@ -190,7 +224,7 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
                 image_paths = [os.path.join(folder_path, f) for f in sorted(os.listdir(folder_path)) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
                 
                 if image_paths:
-                    ocr_data = get_ocr_results(image_paths, lang)
+                    ocr_data = get_ocr_results(image_paths)
                     for name, blocks in ocr_data.items():
                         folder_data["images"].append({"image_name": name, "text_blocks": blocks})
                 
@@ -202,13 +236,12 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
         
         await update.message.reply_document(document=open(json_path, 'rb'))
 
-    await update.message.reply_text("Done! What would you like to do next?")
-    return await start(update, context)
+    await update.message.reply_text("Done! What would you like to do next? /start")
+    return ConversationHandler.END
 
 
 # --- 2. JSON to Comic Translate ---
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the JSON Translate sub-menu."""
     reply_keyboard = [["image upload", "zip upload"]]
     await update.message.reply_text(
         "How would you like to provide the files for translation?",
@@ -217,12 +250,10 @@ async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     return JSON_TRANSLATE_CHOICE
 
 async def json_translate_prompt_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Asks for JSON before asking for the zip file."""
     await update.message.reply_text("First, please upload the JSON file.", reply_markup=ReplyKeyboardRemove())
     return WAITING_JSON_TRANSLATE_ZIP
 
 async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receives JSON, stores it, and asks for the zip file."""
     json_doc = await update.message.document.get_file()
     json_bytes = await json_doc.download_as_bytearray()
     context.user_data['json_data'] = json.loads(json_bytes.decode('utf-8'))
@@ -230,7 +261,6 @@ async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.
     return WAITING_ZIP_TRANSLATE
 
 async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Draws text on images in a zip based on a JSON file and sends back a new zip."""
     zip_file = await update.message.document.get_file()
     json_data = context.user_data.pop('json_data')
     
@@ -269,6 +299,7 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
                     for block in image_info.get("text_blocks", []):
                         x1, y1, x2, y2 = map(int, block["location"])
                         text = block["text"]
+                        # Simple rectangle and text; can be fancier
                         draw.rectangle([x1, y1, x2, y2], fill="white")
                         draw.text((x1, y1), text, font=font, fill="black")
                     
@@ -279,10 +310,9 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
         
         await update.message.reply_document(document=open(output_zip_path, 'rb'))
 
-    await update.message.reply_text("Done! What would you like to do next?")
-    return await start(update, context)
+    await update.message.reply_text("Done! What would you like to do next? /start")
+    return ConversationHandler.END
 
-# Placeholder for the image-based translation (left as an exercise for brevity)
 async def not_implemented(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("This feature is not yet implemented.", reply_markup=ReplyKeyboardRemove())
     return await start(update, context)
@@ -290,7 +320,6 @@ async def not_implemented(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # --- 3. JSON Divide ---
 async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the JSON Divide sub-menu."""
     reply_keyboard = [["zip upload"]]
     await update.message.reply_text(
         "This function requires a master JSON file and a zip file.",
@@ -299,12 +328,10 @@ async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return JSON_DIVIDE_CHOICE
 
 async def json_divide_prompt_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Asks for the master JSON file."""
     await update.message.reply_text("First, please upload the master JSON file.", reply_markup=ReplyKeyboardRemove())
     return WAITING_JSON_DIVIDE
 
 async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receives JSON, stores it, and asks for the zip file."""
     json_doc = await update.message.document.get_file()
     json_bytes = await json_doc.download_as_bytearray()
     context.user_data['json_data'] = json.loads(json_bytes.decode('utf-8'))
@@ -312,7 +339,6 @@ async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAITING_ZIP_DIVIDE
 
 async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Splits JSON, masks images, and creates a new zip."""
     zip_file = await update.message.document.get_file()
     json_data = context.user_data.pop('json_data')
 
@@ -331,13 +357,11 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
             current_folder_path = os.path.join(extract_path, folder_name)
             
             if os.path.isdir(current_folder_path):
-                # 1. Create the smaller JSON for this folder
                 folder_json_data = {"images": folder_info.get("images", [])}
                 folder_json_path = os.path.join(current_folder_path, f"{folder_name}.json")
                 with open(folder_json_path, 'w', encoding='utf-8') as f:
                     json.dump(folder_json_data, f, ensure_ascii=False, indent=4)
                 
-                # 2. Mask the images in this folder
                 for image_info in folder_info.get("images", []):
                     image_name = image_info["image_name"]
                     image_path = os.path.join(current_folder_path, image_name)
@@ -345,87 +369,61 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
                     if os.path.exists(image_path):
                         img = Image.open(image_path).convert("RGB")
                         draw = ImageDraw.Draw(img)
-                        
                         for block in image_info.get("text_blocks", []):
                             x1, y1, x2, y2 = map(int, block["location"])
-                            draw.rectangle([x1, y1, x2, y2], fill="black") # Mask with black
-                        
+                            draw.rectangle([x1, y1, x2, y2], fill="black")
                         img.save(image_path)
         
-        # 3. Create the new zip file
         output_zip_path = os.path.join(temp_dir, "divided_and_masked.zip")
         shutil.make_archive(output_zip_path.replace('.zip', ''), 'zip', extract_path)
         
         await update.message.reply_document(document=open(output_zip_path, 'rb'))
         
-    await update.message.reply_text("Done! What would you like to do next?")
-    return await start(update, context)
+    await update.message.reply_text("Done! What would you like to do next? /start")
+    return ConversationHandler.END
 
 
 # --- 4. Choose OCR Language ---
 async def choose_lang_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays language selection buttons."""
-    buttons = [
-        InlineKeyboardButton(lang, callback_data=f"lang_{lang}")
-        for lang in SUPPORTED_LANGS
-    ]
-    keyboard = [buttons[i:i + 3] for i in range(0, len(buttons), 3)] # 3 buttons per row
-    
+    """This feature is disabled as Florence-2 is multilingual by default."""
     await update.message.reply_text(
-        "Please choose the OCR language:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "The current OCR model (Florence-2) is multilingual by default and does not require language selection.",
+        reply_markup=ReplyKeyboardRemove()
     )
-    return CHOOSE_LANG
-
-async def set_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Sets the OCR language based on user selection."""
-    query = update.callback_query
-    await query.answer()
-    
-    lang_code = query.data.split('_')[1]
-    context.user_data['ocr_lang'] = [lang_code]
-    
-    await query.edit_message_text(text=f"OCR language set to: {CODE_TO_LANGUAGE[lang_code]} ({lang_code})")
-    await query.message.reply_text("What would you like to do next?")
-    return await start(query.message, context) # Use query.message to send a new message
+    return await start(update, context)
 
 
 # --- Media Group Handler ---
 async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Collects all messages from a media group."""
     if 'media_group' not in context.user_data:
         context.user_data['media_group'] = []
     
     context.user_data['media_group'].append(update.message)
 
-    # Schedule a job to process the group after a short delay
-    # This prevents multiple processing calls for one group
     job_name = f"process_media_group_{update.message.media_group_id}"
+    # Schedule job only if it doesn't exist
     if not context.job_queue.get_jobs_by_name(job_name):
         context.job_queue.run_once(
             process_media_group_job, 
-            when=1, # 1 second delay
-            data={'chat_id': update.effective_chat.id, 'state': WAITING_IMAGES_OCR},
+            when=2, # 2 second delay to collect all images
+            data={'chat_id': update.effective_chat.id},
             name=job_name
         )
 
 async def process_media_group_job(context: ContextTypes.DEFAULT_TYPE):
     """Job to process a collected media group."""
-    # This is a bit of a workaround to call the handler from a job
-    # We pass a mock update object
     class MockUpdate:
-        class MockMessage:
-            async def reply_text(self, *args, **kwargs):
-                return await context.bot.send_message(context.job.data['chat_id'], *args, **kwargs)
-            async def reply_document(self, *args, **kwargs):
-                return await context.bot.send_document(context.job.data['chat_id'], *args, **kwargs)
-        message = MockMessage()
+        def __init__(self, chat_id):
+            self.effective_chat = type('chat', (), {'id': chat_id})
+            self.message = type('message', (), {
+                'reply_text': lambda *args, **kwargs: context.bot.send_message(chat_id, *args, **kwargs),
+                'reply_document': lambda *args, **kwargs: context.bot.send_document(chat_id, *args, **kwargs)
+            })()
 
-    await json_maker_process_images(MockUpdate(), context)
+    await json_maker_process_images(MockUpdate(context.job.data['chat_id']), context)
 
 # --- Main Function to Run the Bot ---
 def main() -> None:
-    """Run the bot."""
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("Error: Please replace 'YOUR_BOT_TOKEN_HERE' with your actual bot token.")
         return
@@ -441,29 +439,23 @@ def main() -> None:
                 MessageHandler(filters.Regex("^json divide$"), json_divide_menu),
                 MessageHandler(filters.Regex("^Choose ocr language$"), choose_lang_menu),
             ],
-            # JSON Maker States
             JSON_MAKER_CHOICE: [
                 MessageHandler(filters.Regex("^image upload$"), json_maker_prompt_image),
                 MessageHandler(filters.Regex("^zip upload$"), json_maker_prompt_zip),
             ],
             WAITING_IMAGES_OCR: [
-                MessageHandler(filters.PHOTO & ~filters.ChatType.PRIVATE, handle_media_group), # Handles groups
-                MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, json_maker_process_images), # Handles single images
+                MessageHandler(filters.PHOTO & filters.UpdateType.MESSAGE, handle_media_group),
             ],
             WAITING_ZIP_OCR: [MessageHandler(filters.Document.ZIP, json_maker_process_zip)],
-            # JSON Translate States
             JSON_TRANSLATE_CHOICE: [
-                MessageHandler(filters.Regex("^image upload$"), not_implemented), # Placeholder
+                MessageHandler(filters.Regex("^image upload$"), not_implemented),
                 MessageHandler(filters.Regex("^zip upload$"), json_translate_prompt_json_for_zip),
             ],
             WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.JSON, json_translate_get_json_for_zip)],
             WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
-            # JSON Divide States
             JSON_DIVIDE_CHOICE: [MessageHandler(filters.Regex("^zip upload$"), json_divide_prompt_json)],
             WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.JSON, json_divide_get_json)],
             WAITING_ZIP_DIVIDE: [MessageHandler(filters.Document.ZIP, json_divide_process_zip)],
-            # Language Choice State
-            CHOOSE_LANG: [CallbackQueryHandler(set_lang, pattern="^lang_")],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
