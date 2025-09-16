@@ -59,7 +59,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_ID = "microsoft/Florence-2-large"
 
 logger.info(f"Loading Florence-2 model ({MODEL_ID}) onto {DEVICE}...")
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, trust_remote_code=True).to(DEVICE)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, trust_remote_code=True, attn_implementation="eager").to(DEVICE)
 processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
 logger.info("Florence-2 model loaded successfully.")
 
