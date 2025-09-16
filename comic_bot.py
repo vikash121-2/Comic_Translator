@@ -454,7 +454,7 @@ def main() -> None:
             WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension('json'), json_translate_get_json_for_zip)],
             WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
             JSON_DIVIDE_CHOICE: [MessageHandler(filters.Regex("^zip upload$"), json_divide_prompt_json)],
-            WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.JSON, json_divide_get_json)],
+            WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.FileExtension('json'), json_divide_get_json)],
             WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.FileExtension('json'), json_divide_get_json)],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
