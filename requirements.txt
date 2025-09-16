@@ -1,5 +1,7 @@
 # For CPU
-pip install torch torchvision torchaudio
-pip install python-telegram-bot --upgrade
-pip install surya-ocr
-pip install Pillow
+torch
+torchvision
+torchaudio
+python-telegram-bot --upgrade
+surya-ocr
+Pillow
