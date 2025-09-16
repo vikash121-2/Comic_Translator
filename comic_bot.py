@@ -1,10 +1,3 @@
-# Add these 4 lines to the very top of your script
-import sys
-import site
-
-# This forces Python to look in the user's local installation directory.
-if site.USER_SITE not in sys.path:
-    sys.path.insert(0, site.USER_SITE)
 import logging
 import os
 import zipfile
@@ -47,54 +40,70 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
 FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
-
 # Conversation states
 (
     MAIN_MENU,
-    JSON_MAKER_CHOICE, WAITING_IMAGES_OCR, #... add more if needed
+    JSON_MAKER_CHOICE, WAITING_IMAGES_OCR,
 ) = range(3)
 
-# --- NEW: Load Surya OCR model ---
+# --- NEW: Load DocTR model ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"Loading Surya OCR model onto {DEVICE}...")
+logger.info(f"Loading DocTR OCR model onto {DEVICE}...")
 try:
-    from surya.ocr import run_ocr
-    from surya.model.detection import segformer
-    from surya.model.recognition import vit
-    
-    det_processor, det_model = segformer.load_processor_and_model()
-    rec_processor, rec_model = vit.load_processor_and_model()
-    logger.info("Surya OCR model loaded successfully.")
+    from doctr.models import ocr_predictor
+    from doctr.io import DocumentFile
+    # This will download the models on the first run
+    model = ocr_predictor(pretrained=True)
+    model.to(DEVICE)
+    logger.info("DocTR OCR model loaded successfully.")
 except Exception as e:
-    logger.critical(f"Critical Error: Could not load Surya OCR model. Error: {e}")
+    logger.critical(f"Critical Error: Could not load DocTR model. Error: {e}")
+    logger.critical(traceback.format_exc())
     exit(1)
 
 # --- Helper & Utility Functions ---
 
 def get_ocr_results(image_paths: List[str]) -> Dict:
-    """Runs OCR on a list of images using Surya OCR."""
+    """Runs OCR on a list of images using DocTR."""
     results = {}
     try:
-        images = [Image.open(p).convert("RGB") for p in image_paths]
-        # Using English as a default, this can be made configurable again if needed
-        predictions = run_ocr(images, [['en']] * len(images), det_model, det_processor, rec_model, rec_processor)
+        # Load images into a document object that doctr can read
+        doc = DocumentFile.from_images(image_paths)
+        
+        # Run the OCR predictor
+        ocr_result = model(doc)
 
-        for i, (pred, image_path) in enumerate(zip(predictions, image_paths)):
-            image_name = os.path.basename(image_path)
+        # Process the results
+        for img_path, page in zip(image_paths, ocr_result.pages):
+            image_name = os.path.basename(img_path)
+            height, width = page.dimensions
+            
             text_blocks = []
-            if pred is not None:
-                for line in pred.text_lines:
+            for block in page.blocks:
+                for line in block.lines:
+                    # Reconstruct the full line of text
+                    line_text = ' '.join([word.value for word in line.words])
+                    
+                    # Calculate the bounding box for the entire line
+                    x_coords = [word.geometry[0][0] for word in line.words] + [word.geometry[1][0] for word in line.words]
+                    y_coords = [word.geometry[0][1] for word in line.words] + [word.geometry[1][1] for word in line.words]
+                    
+                    # Un-normalize the coordinates
+                    xmin = int(min(x_coords) * width)
+                    ymin = int(min(y_coords) * height)
+                    xmax = int(max(x_coords) * width)
+                    ymax = int(max(y_coords) * height)
+                    
                     text_blocks.append({
-                        "text": line.text,
-                        "location": line.bbox
+                        "text": line_text,
+                        "location": [xmin, ymin, xmax, ymax]
                     })
             results[image_name] = text_blocks
-            logger.info(f"Successfully processed {image_name}")
+            logger.info(f"Successfully processed {image_name} with DocTR.")
             
     except Exception as e:
-        logger.error(f"Failed during Surya OCR processing: {e}")
+        logger.error(f"Failed during DocTR processing: {e}")
         logger.error(traceback.format_exc())
-        # On total failure, create empty results for all images
         for image_path in image_paths:
             results[os.path.basename(image_path)] = []
     
@@ -115,7 +124,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    message_text = "Welcome! Please choose an option:"
+    message_text = "Welcome! This bot uses DocTR for OCR. Please choose an option:"
     if update.message:
         await update.message.reply_text(message_text, reply_markup=reply_markup)
     elif update.callback_query:
@@ -134,7 +143,6 @@ async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     keyboard = [
         [InlineKeyboardButton("🖼️ Image Upload", callback_data="jm_image")],
-        [InlineKeyboardButton("🗂️ Zip Upload (WIP)", callback_data="jm_zip")],
         [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -151,7 +159,6 @@ async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_
     return WAITING_IMAGES_OCR
 
 async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # This function is unchanged
     try:
         temp_dir_path = context.user_data['temp_dir'].name
         image_paths = context.user_data['image_paths']
@@ -189,7 +196,7 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Processing images with Surya OCR...")
+    await query.edit_message_text("Processing images with DocTR...")
     
     image_paths = context.user_data.get('image_paths', [])
     if not image_paths:
@@ -203,7 +210,7 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     total_text_blocks = sum(len(img["text_blocks"]) for img in final_json["images"])
     if total_text_blocks == 0:
         await query.edit_message_text(
-            "I couldn't extract any text from the image(s). The image might be blurry or the text too stylized. Returning to menu."
+            "I couldn't extract any text from the image(s). The image might be blurry or contain no recognizable text. Returning to menu."
         )
         cleanup_user_data(context)
         await asyncio.sleep(4)
@@ -219,16 +226,10 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     cleanup_user_data(context)
     return await start(update, context)
 
-async def not_implemented_yet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer("This feature is a work in progress.", show_alert=True)
-    return MAIN_MENU
-
 # --- Main Application Setup ---
 
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
-
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -238,7 +239,6 @@ def main() -> None:
             ],
             JSON_MAKER_CHOICE: [
                 CallbackQueryHandler(json_maker_prompt_image, pattern="^jm_image$"),
-                CallbackQueryHandler(not_implemented_yet, pattern="^jm_zip$"),
                 CallbackQueryHandler(start, pattern="^main_menu_start$"),
             ],
             WAITING_IMAGES_OCR: [
@@ -248,7 +248,6 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("start", start)],
     )
-
     application.add_handler(conv_handler)
     application.run_polling()
 
