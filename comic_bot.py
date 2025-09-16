@@ -54,6 +54,9 @@ FONT_PATH = "font.ttf"
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
 FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_ID = "microsoft/Florence-2-large"  # <-- ADD THIS LINE
+
 logger.info(f"Loading Florence-2 model ({MODEL_ID}) onto {DEVICE}...")
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, trust_remote_code=True, attn_implementation="eager").to(DEVICE)
 processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
