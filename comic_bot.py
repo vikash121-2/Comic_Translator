@@ -48,12 +48,14 @@ try:
     use_gpu = torch.cuda.is_available()
     logger.info(f"GPU available: {use_gpu}")
 
-    # FINAL: Create a separate reader for each required language family
     reader_ja = easyocr.Reader(['ja', 'en'], gpu=use_gpu)
     logger.info("Loaded Japanese model.")
     reader_ko = easyocr.Reader(['ko', 'en'], gpu=use_gpu)
     logger.info("Loaded Korean model.")
-    reader_sim = easyocr.Reader(['ch_sim', 'en'], gpu=use_gpus)
+    
+    # CORRECTED: Changed use_gpus to use_gpu
+    reader_sim = easyocr.Reader(['ch_sim', 'en'], gpu=use_gpu)
+    
     logger.info("Loaded Simplified Chinese model.")
     reader_tra = easyocr.Reader(['ch_tra', 'en'], gpu=use_gpu)
     logger.info("Loaded Traditional Chinese model.")
@@ -82,17 +84,14 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
         try:
             preprocessed_image = preprocess_for_ocr(image_path)
             
-            # Run all readers and combine results
             output_ja = reader_ja.readtext(preprocessed_image)
             output_ko = reader_ko.readtext(preprocessed_image)
             output_sim = reader_sim.readtext(preprocessed_image)
             output_tra = reader_tra.readtext(preprocessed_image)
             combined_output = output_ja + output_ko + output_sim + output_tra
             
-            # De-duplicate results to avoid multiple entries for the same English text
             unique_results = {}
             for (bbox, text, prob) in combined_output:
-                # A simple key based on the text and the approximate top-left corner
                 box_key = (text, int(bbox[0][1] / 10), int(bbox[0][0] / 10))
                 if box_key not in unique_results:
                     unique_results[box_key] = (bbox, text, prob)
