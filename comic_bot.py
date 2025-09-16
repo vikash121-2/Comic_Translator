@@ -163,29 +163,46 @@ async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_
     return WAITING_IMAGES_OCR
 
 async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receives an image, saves it, and asks for more or to finish."""
+    """Receives a photo OR an image document, saves it, and asks for more or to finish."""
     try:
         temp_dir_path = context.user_data['temp_dir'].name
         image_paths = context.user_data['image_paths']
     except KeyError:
-        # Handle case where the user sends an image unexpectedly
         await update.message.reply_text("Something went wrong. Please start over with /start.")
+        cleanup_user_data(context)
         return ConversationHandler.END
 
-    photo_file = await update.message.photo[-1].get_file()
-    file_path = os.path.join(temp_dir_path, f"{photo_file.file_id}.jpg")
-    await photo_file.download_to_drive(file_path)
+    file_to_download = None
+    file_name = None
+
+    if update.message.photo:
+        # It's a compressed photo
+        photo = update.message.photo[-1]
+        file_to_download = await photo.get_file()
+        file_name = f"{photo.file_id}.jpg"
+    elif update.message.document and update.message.document.mime_type.startswith('image/'):
+        # It's an image sent as a document
+        doc = update.message.document
+        file_to_download = await doc.get_file()
+        file_name = doc.file_name
+    else:
+        # Not an image, ignore it and stay in the same state
+        await update.message.reply_text("That doesn't seem to be an image. Please send a photo or image file.")
+        return WAITING_IMAGES_OCR
+
+    # Proceed with downloading and replying
+    file_path = os.path.join(temp_dir_path, file_name)
+    await file_to_download.download_to_drive(file_path)
     image_paths.append(file_path)
 
     keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="jm_process_images")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await update.message.reply_text(
         f"Image {len(image_paths)} received. Send another, or press Done.",
         reply_markup=reply_markup
     )
     return WAITING_IMAGES_OCR
-
 
 async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Processes all collected images, sends JSON, and returns to the main menu."""
@@ -247,7 +264,7 @@ def main() -> None:
                 CallbackQueryHandler(start, pattern="^main_menu_start$"),
             ],
             WAITING_IMAGES_OCR: [
-                MessageHandler(filters.PHOTO, collect_images),
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, collect_images),
                 CallbackQueryHandler(process_collected_images, pattern="^jm_process_images$"),
             ],
             WAITING_ZIP_OCR: [
