@@ -7,6 +7,8 @@ import torch
 import tempfile
 import traceback
 import asyncio
+import cv2
+import numpy as np
 from typing import List, Dict
 
 from PIL import Image, ImageDraw, ImageFont, ImageFile
@@ -53,8 +55,12 @@ try:
     import easyocr
     use_gpu = torch.cuda.is_available()
     logger.info(f"GPU available: {use_gpu}")
-    reader = easyocr.Reader(['ch_sim', 'en'], gpu=use_gpu) 
-    logger.info("easyocr model loaded successfully.")
+    
+    # UPDATED: Language list now includes Japanese, Korean, and both Chinese variants
+    lang_list = ['ja', 'ko', 'ch_sim', 'ch_tra', 'en']
+    reader = easyocr.Reader(lang_list, gpu=use_gpu) 
+    
+    logger.info("easyocr model loaded successfully for languages: %s", lang_list)
 except Exception as e:
     logger.critical(f"Critical Error: Could not load easyocr model. Error: {e}")
     logger.critical(traceback.format_exc())
@@ -62,25 +68,58 @@ except Exception as e:
 
 # --- Helper & Utility Functions ---
 
+def preprocess_for_ocr(image_path: str) -> np.ndarray:
+    """Uses OpenCV to preprocess the image for better OCR accuracy."""
+    try:
+        image = cv2.imread(image_path)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        processed_image = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        return processed_image
+    except Exception as e:
+        logger.error(f"OpenCV preprocessing failed for {image_path}: {e}")
+        return cv2.imread(image_path)
+
 def get_ocr_results(image_paths: List[str]) -> Dict:
+    """Runs OCR on a list of preprocessed images using easyocr."""
     results = {}
     for image_path in image_paths:
         image_name = os.path.basename(image_path)
         try:
-            ocr_output = reader.readtext(image_path)
+            preprocessed_image = preprocess_for_ocr(image_path)
+            ocr_output = reader.readtext(preprocessed_image)
+            
             text_blocks = []
             for (bbox, text, prob) in ocr_output:
                 x_coords = [int(p[0]) for p in bbox]
                 y_coords = [int(p[1]) for p in bbox]
                 simple_bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
-                text_blocks.append({"text": text, "location": simple_bbox})
+                
+                text_blocks.append({
+                    "text": text,
+                    "location": simple_bbox
+                })
+
             results[image_name] = text_blocks
             logger.info(f"Successfully processed {image_name} with easyocr.")
+            
         except Exception as e:
             logger.error(f"Failed to process image {image_path} with easyocr: {e}")
             logger.error(traceback.format_exc())
             results[image_name] = []
     return results
+
+def sort_text_blocks(ocr_data: Dict) -> Dict:
+    """Sorts text blocks in each image by reading order (top-to-bottom, left-to-right)."""
+    sorted_data = {"images": []}
+    for image_info in ocr_data["images"]:
+        sorted_blocks = sorted(image_info["text_blocks"], key=lambda b: (b["location"][1], b["location"][0]))
+        sorted_data["images"].append({
+            "image_name": image_info["image_name"],
+            "text_blocks": sorted_blocks
+        })
+    return sorted_data
 
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
     if 'temp_dir' in context.user_data:
@@ -91,15 +130,8 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
 # --- Main Menu & Core Navigation ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the full main menu."""
-    # RESTORED: All buttons are now present
-    keyboard = [
-        [InlineKeyboardButton("📝 Json maker", callback_data="main_json_maker")],
-        [InlineKeyboardButton("🎨 json To Comic translate", callback_data="main_translate")],
-        [InlineKeyboardButton("✂️ json divide", callback_data="main_divide")],
-    ]
+    keyboard = [[InlineKeyboardButton("📝 Json maker", callback_data="main_json_maker")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     message_text = "Welcome! This bot uses easyocr. Please choose an option:"
     if update.message:
         await update.message.reply_text(message_text, reply_markup=reply_markup)
@@ -111,13 +143,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             logger.info("Callback query already answered.")
         if query.message.text != message_text or query.message.reply_markup != reply_markup:
             await query.edit_message_text(message_text, reply_markup=reply_markup)
-    return MAIN_MENU
-
-# --- Placeholder menus for WIP features ---
-async def not_implemented_yet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer("This feature is a work in progress and not yet implemented.", show_alert=True)
-    # Stay in the main menu state
     return MAIN_MENU
 
 # --- 1. Json Maker Feature ---
@@ -179,7 +204,7 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Processing images with easyocr...")
+    await query.edit_message_text("Preprocessing and processing images with easyocr...")
     
     image_paths = context.user_data.get('image_paths', [])
     if not image_paths:
@@ -188,7 +213,9 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
         return await start(update, context)
 
     ocr_data = get_ocr_results(image_paths)
-    final_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
+    raw_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
+    
+    final_json = sort_text_blocks(raw_json)
     
     total_text_blocks = sum(len(img["text_blocks"]) for img in final_json["images"])
     if total_text_blocks == 0:
@@ -217,10 +244,7 @@ def main() -> None:
         entry_points=[CommandHandler("start", start)],
         states={
             MAIN_MENU: [
-                # RESTORED: Handlers for all buttons
                 CallbackQueryHandler(json_maker_menu, pattern="^main_json_maker$"),
-                CallbackQueryHandler(not_implemented_yet, pattern="^main_translate$"),
-                CallbackQueryHandler(not_implemented_yet, pattern="^main_divide$"),
                 CallbackQueryHandler(start, pattern="^main_menu_start$"), 
             ],
             JSON_MAKER_CHOICE: [
