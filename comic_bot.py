@@ -225,7 +225,7 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(final_json, f, ensure_ascii=False, indent=4)
         
-    await context.bot.send_document(chat_id=query.effective_chat.id, document=open(json_path, 'rb'))
+    await context.bot.send_document(chat_id=query.message.chat.id, document=open(json_path, 'rb'))
     
     cleanup_user_data(context)
     return await start(update, context)
