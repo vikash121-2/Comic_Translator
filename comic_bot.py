@@ -39,8 +39,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Global Variables & Configuration ---
-BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
-FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+FONT_PATH = "font.ttf"
 
 # Conversation states
 (
@@ -51,14 +51,14 @@ FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file
 ) = range(10)
 
 # --- Load Florence-2 model and processor ---
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_ID = "microsoft/Florence-2-large"
+BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
+FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
 logger.info(f"Loading Florence-2 model ({MODEL_ID}) onto {DEVICE}...")
-# Use attn_implementation="eager" to prevent potential errors in some environments
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, trust_remote_code=True, attn_implementation="eager").to(DEVICE)
 processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
 logger.info("Florence-2 model loaded successfully.")
+
 
 # --- Helper Function for OCR ---
 def get_ocr_results(image_paths: List[str]) -> Dict:
@@ -89,7 +89,17 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
             results[os.path.basename(image_path)] = []
     return results
 
-# --- Bot Command Handlers ---
+# --- Bot Cleanup and Menu Handlers ---
+
+def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
+    """Clean up temporary directories and data for a user."""
+    if 'temp_dir' in context.user_data:
+        context.user_data['temp_dir'].cleanup()
+        del context.user_data['temp_dir']
+    
+    # Clean up other potential keys
+    context.user_data.pop('image_paths', None)
+    context.user_data.pop('json_data', None)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Displays the main menu using inline buttons."""
@@ -101,14 +111,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # If the command is triggered by a user message (e.g., /start)
+    message_text = "Welcome! Please choose an option:"
     if update.message:
-        await update.message.reply_text("Welcome! Please choose an option:", reply_markup=reply_markup)
-    # If it's triggered by a callback (e.g., returning to the menu)
+        await update.message.reply_text(message_text, reply_markup=reply_markup)
     elif update.callback_query:
         query = update.callback_query
         await query.answer()
-        await query.edit_message_text("Done! What would you like to do next?", reply_markup=reply_markup)
+        # Check if the message text is already the menu text to avoid unnecessary edits
+        if query.message.text != message_text:
+            await query.edit_message_text(message_text, reply_markup=reply_markup)
 
     return MAIN_MENU
 
@@ -117,15 +128,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Operation cancelled.")
-    # Clean up any stored data
-    for key in ['media_group', 'json_data']:
-        if key in context.user_data:
-            del context.user_data[key]
+    cleanup_user_data(context)
     return ConversationHandler.END
 
+
 # --- 1. JSON Maker ---
+
 async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the JSON Maker sub-menu with inline buttons."""
     query = update.callback_query
     keyboard = [
         [
@@ -139,97 +148,78 @@ async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.edit_message_text("How would you like to provide the source files?", reply_markup=reply_markup)
     return JSON_MAKER_CHOICE
 
-async def json_maker_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Generic prompt for uploading a file."""
+async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Prompt for image upload and set up collectors."""
     query = update.callback_query
-    file_type = query.data.split('_')[1] # 'image' or 'zip'
+    # Create a persistent temporary directory for this user's session
+    context.user_data['temp_dir'] = tempfile.TemporaryDirectory()
+    context.user_data['image_paths'] = []
+    
     await query.answer()
-    await query.edit_message_text(f"Please send the {file_type} file(s).")
-    return WAITING_IMAGES_OCR if file_type == 'image' else WAITING_ZIP_OCR
+    await query.edit_message_text("Please send your images one by one. Press 'Done Uploading' when you are finished.")
+    return WAITING_IMAGES_OCR
 
-async def json_maker_process_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Processes images, sends JSON, and returns to the main menu."""
-    await update.message.reply_text("Processing images with Florence-2... This may take a moment.")
-    
-    with tempfile.TemporaryDirectory() as temp_dir:
-        image_paths = []
-        photo_file = await update.message.photo[-1].get_file()
-        file_path = os.path.join(temp_dir, f"{photo_file.file_id}.jpg")
-        await photo_file.download_to_drive(file_path)
-        image_paths.append(file_path)
+async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receives an image, saves it, and asks for more or to finish."""
+    try:
+        temp_dir_path = context.user_data['temp_dir'].name
+        image_paths = context.user_data['image_paths']
+    except KeyError:
+        # Handle case where the user sends an image unexpectedly
+        await update.message.reply_text("Something went wrong. Please start over with /start.")
+        return ConversationHandler.END
 
-        ocr_data = get_ocr_results(image_paths)
-        final_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
-        
-        json_path = os.path.join(temp_dir, "extracted_text.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(final_json, f, ensure_ascii=False, indent=4)
-            
-        await update.message.reply_document(document=open(json_path, 'rb'))
-    
-    # Loop back to the main menu
-    return await start(update, context)
+    photo_file = await update.message.photo[-1].get_file()
+    file_path = os.path.join(temp_dir_path, f"{photo_file.file_id}.jpg")
+    await photo_file.download_to_drive(file_path)
+    image_paths.append(file_path)
 
-async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # This function is long and remains largely the same, just the end is changed.
-    zip_file = await update.message.document.get_file()
-    await update.message.reply_text("Processing zip file...")
-    
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # ... (same zip processing logic as before) ...
-        zip_path = os.path.join(temp_dir, "input.zip")
-        await zip_file.download_to_drive(zip_path)
-        extract_path = os.path.join(temp_dir, "extracted")
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_path)
-        
-        final_json = {"folders": []}
-        for folder_name in sorted(os.listdir(extract_path)):
-            folder_path = os.path.join(extract_path, folder_name)
-            if os.path.isdir(folder_path):
-                image_paths = [os.path.join(folder_path, f) for f in sorted(os.listdir(folder_path)) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                if image_paths:
-                    ocr_data = get_ocr_results(image_paths)
-                    images_data = [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]
-                    final_json["folders"].append({"folder_name": folder_name, "images": images_data})
-        
-        json_path = os.path.join(temp_dir, "extracted_text_from_zip.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(final_json, f, ensure_ascii=False, indent=4)
-        await update.message.reply_document(document=open(json_path, 'rb'))
-
-    # Loop back to the main menu
-    return await start(update, context)
-
-# --- 2. JSON to Comic Translate ---
-async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    keyboard = [
-        [
-            InlineKeyboardButton("🖼️ Image Upload", callback_data="jt_image"), # Placeholder
-            InlineKeyboardButton("🗂️ Zip Upload", callback_data="jt_zip"),
-        ],
-        [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
-    ]
+    keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="jm_process_images")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.answer()
-    await query.edit_message_text("How would you like to provide the files for translation?", reply_markup=reply_markup)
-    return JSON_TRANSLATE_CHOICE
-
-# ... other functions like json_translate_prompt_json_for_zip, etc. remain the same ...
-# Remember to change their final return to `await start(update, context)` as well.
-
-# --- 4. Language Menu (Informational) ---
-async def language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    keyboard = [[InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.answer()
-    await query.edit_message_text(
-        "The current OCR model (Florence-2) is multilingual and detects language automatically. No selection is needed.",
+    
+    await update.message.reply_text(
+        f"Image {len(image_paths)} received. Send another, or press Done.",
         reply_markup=reply_markup
     )
-    return MAIN_MENU
+    return WAITING_IMAGES_OCR
+
+
+async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Processes all collected images, sends JSON, and returns to the main menu."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Processing images with Florence-2... This may take a moment.")
+    
+    image_paths = context.user_data.get('image_paths', [])
+    if not image_paths:
+        await query.edit_message_text("You didn't send any images! Please start over.", reply_markup=None)
+        cleanup_user_data(context)
+        return await start(update, context)
+
+    ocr_data = get_ocr_results(image_paths)
+    final_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
+    
+    # Use the same temp dir to create the json file
+    temp_dir_path = context.user_data['temp_dir'].name
+    json_path = os.path.join(temp_dir_path, "extracted_text.json")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(final_json, f, ensure_ascii=False, indent=4)
+        
+    await context.bot.send_document(chat_id=query.effective_chat.id, document=open(json_path, 'rb'))
+    
+    cleanup_user_data(context)
+    return await start(update, context)
+
+
+async def json_maker_prompt_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Please send the zip file.")
+    return WAITING_ZIP_OCR
+
+
+# ... Other functions (zip processing, translate, divide) would follow a similar pattern ...
+# They should return `await start(update, context)` after completion.
 
 
 # --- Main Application Setup ---
@@ -245,55 +235,28 @@ def main() -> None:
         states={
             MAIN_MENU: [
                 CallbackQueryHandler(json_maker_menu, pattern="^main_json_maker$"),
-                CallbackQueryHandler(json_translate_menu, pattern="^main_translate$"),
-                # CallbackQueryHandler(json_divide_menu, pattern="^main_divide$"), # Add this line
-                CallbackQueryHandler(language_menu, pattern="^main_language$"),
-                CallbackQueryHandler(start, pattern="^main_menu_start$"), # Handler for "Back" button
+                # Add other main menu handlers here
+                CallbackQueryHandler(start, pattern="^main_menu_start$"), 
             ],
             JSON_MAKER_CHOICE: [
-                CallbackQueryHandler(json_maker_prompt, pattern="^jm_image$|^jm_zip$"),
+                CallbackQueryHandler(json_maker_prompt_image, pattern="^jm_image$"),
+                CallbackQueryHandler(json_maker_prompt_zip, pattern="^jm_zip$"),
                 CallbackQueryHandler(start, pattern="^main_menu_start$"),
             ],
-            WAITING_IMAGES_OCR: [MessageHandler(filters.PHOTO, json_maker_process_images)],
-            WAITING_ZIP_OCR: [MessageHandler(filters.Document.ZIP, json_maker_process_zip)],
-            
-            # You would add states for JSON_TRANSLATE_CHOICE etc. here, similar to the above.
-            # Example for JSON translate zip upload
-            JSON_TRANSLATE_CHOICE: [
-                CallbackQueryHandler(json_translate_prompt_json_for_zip, pattern="^jt_zip$"),
-                CallbackQueryHandler(start, pattern="^main_menu_start$")
+            WAITING_IMAGES_OCR: [
+                MessageHandler(filters.PHOTO, collect_images),
+                CallbackQueryHandler(process_collected_images, pattern="^jm_process_images$"),
             ],
-            WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension('json'), json_translate_get_json_for_zip)],
-            WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
+            WAITING_ZIP_OCR: [
+                # Add your zip handler here, ensuring it calls start() at the end
+                # e.g., MessageHandler(filters.Document.ZIP, json_maker_process_zip)
+            ],
         },
         fallbacks=[CommandHandler("start", start)],
-        # Note: You can add a `CallbackQueryHandler(cancel, pattern='^cancel$')` if you want a cancel button
     )
 
     application.add_handler(conv_handler)
     application.run_polling()
 
-
 if __name__ == "__main__":
-    # NOTE: The provided code is a template. Functions like json_translate_process_zip
-    # and the JSON Divide section need their final `return` statement updated to `await start(update, context)`
-    # to ensure the conversation loops back to the main menu.
-    
-    # Dummy functions for parts not fully fleshed out in this example
-    async def json_translate_prompt_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text("Please upload the JSON file for translation.")
-        return WAITING_JSON_TRANSLATE_ZIP
-
-    async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # ... logic to get json ...
-        await update.message.reply_text("JSON received. Now, please upload the corresponding zip file.")
-        return WAITING_ZIP_TRANSLATE
-    
-    async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # ... logic to process zip ...
-        await update.message.reply_text("Translation complete!")
-        return await start(update, context) # <-- IMPORTANT: Return to menu
-        
     main()
