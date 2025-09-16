@@ -53,7 +53,7 @@ try:
     logger.info("Loaded Japanese model.")
     reader_ko = easyocr.Reader(['ko', 'en'], gpu=use_gpu)
     logger.info("Loaded Korean model.")
-    reader_sim = easyocr.Reader(['ch_sim', 'en'], gpu=use_gpus, e)
+    reader_sim = easyocr.Reader(['ch_sim', 'en'], gpu=use_gpus)
     logger.info("Loaded Simplified Chinese model.")
     reader_tra = easyocr.Reader(['ch_tra', 'en'], gpu=use_gpu)
     logger.info("Loaded Traditional Chinese model.")
