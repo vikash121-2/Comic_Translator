@@ -6,6 +6,7 @@ import json
 import torch
 import tempfile
 import traceback
+from telegram.error import BadRequest
 import asyncio
 from typing import List, Dict
 
@@ -102,8 +103,7 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
 # --- Main Menu & Core Navigation ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the full main menu."""
-    # RESTORED: All buttons are now present
+    """Displays the full main menu and safely handles callbacks."""
     keyboard = [
         [InlineKeyboardButton("📝 Json maker", callback_data="main_json_maker")],
         [InlineKeyboardButton("🎨 json To Comic translate", callback_data="main_translate")],
@@ -111,13 +111,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         [InlineKeyboardButton("🌐 Choose ocr language", callback_data="main_language")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     message_text = "Welcome! Please choose an option:"
     if update.message:
         await update.message.reply_text(message_text, reply_markup=reply_markup)
     elif update.callback_query:
         query = update.callback_query
-        await query.answer()
+        try:
+            # This will only succeed if the query hasn't been answered yet.
+            await query.answer()
+        except BadRequest:
+            # This happens if the query was already answered in a previous step.
+            # We can safely ignore it and just continue to draw the menu.
+            logger.info("Callback query already answered, ignoring.")
+
         # Avoid editing the message if it's already the menu to prevent flicker
         if query.message.text != message_text or query.message.reply_markup != reply_markup:
             await query.edit_message_text(message_text, reply_markup=reply_markup)
