@@ -1,3 +1,10 @@
+# Add these 4 lines to the very top of your script
+import sys
+import site
+
+# This forces Python to look in the user's local installation directory.
+if site.USER_SITE not in sys.path:
+    sys.path.insert(0, site.USER_SITE)
 import logging
 import os
 import zipfile
