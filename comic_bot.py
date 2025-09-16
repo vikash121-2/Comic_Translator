@@ -49,18 +49,25 @@ FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file
     JSON_MAKER_CHOICE, WAITING_IMAGES_OCR,
 ) = range(3)
 
-# --- Load easyocr model ---
-logger.info(f"Loading easyocr model...")
+# --- Load easyocr models ---
+logger.info(f"Loading easyocr models...")
 try:
     import easyocr
     use_gpu = torch.cuda.is_available()
     logger.info(f"GPU available: {use_gpu}")
     
-    # UPDATED: Language list now includes Japanese, Korean, and both Chinese variants
-    lang_list = ['ja', 'ko', 'ch_sim', 'ch_tra', 'en']
-    reader = easyocr.Reader(lang_list, gpu=use_gpu) 
-    
-    logger.info("easyocr model loaded successfully for languages: %s", lang_list)
+    # NEW: Create two separate readers due to library limitations
+    # Reader 1: For Japanese, Korean, Simplified Chinese, and English
+    cjk_lang_list = ['ja', 'ko', 'ch_sim', 'en']
+    reader_cjk = easyocr.Reader(cjk_lang_list, gpu=use_gpu) 
+    logger.info("Loaded CJK easyocr model for languages: %s", cjk_lang_list)
+
+    # Reader 2: Specialized for Traditional Chinese and English
+    tra_lang_list = ['ch_tra', 'en']
+    reader_tra = easyocr.Reader(tra_lang_list, gpu=use_gpu)
+    logger.info("Loaded Traditional Chinese easyocr model for languages: %s", tra_lang_list)
+
+    logger.info("All easyocr models loaded successfully.")
 except Exception as e:
     logger.critical(f"Critical Error: Could not load easyocr model. Error: {e}")
     logger.critical(traceback.format_exc())
@@ -69,7 +76,6 @@ except Exception as e:
 # --- Helper & Utility Functions ---
 
 def preprocess_for_ocr(image_path: str) -> np.ndarray:
-    """Uses OpenCV to preprocess the image for better OCR accuracy."""
     try:
         image = cv2.imread(image_path)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -82,16 +88,20 @@ def preprocess_for_ocr(image_path: str) -> np.ndarray:
         return cv2.imread(image_path)
 
 def get_ocr_results(image_paths: List[str]) -> Dict:
-    """Runs OCR on a list of preprocessed images using easyocr."""
+    """Runs OCR on a list of images using both easyocr readers and combines results."""
     results = {}
     for image_path in image_paths:
         image_name = os.path.basename(image_path)
         try:
             preprocessed_image = preprocess_for_ocr(image_path)
-            ocr_output = reader.readtext(preprocessed_image)
+            
+            # NEW: Run both readers and combine their outputs
+            ocr_output_cjk = reader_cjk.readtext(preprocessed_image)
+            ocr_output_tra = reader_tra.readtext(preprocessed_image)
+            combined_output = ocr_output_cjk + ocr_output_tra
             
             text_blocks = []
-            for (bbox, text, prob) in ocr_output:
+            for (bbox, text, prob) in combined_output:
                 x_coords = [int(p[0]) for p in bbox]
                 y_coords = [int(p[1]) for p in bbox]
                 simple_bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
@@ -111,7 +121,6 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
     return results
 
 def sort_text_blocks(ocr_data: Dict) -> Dict:
-    """Sorts text blocks in each image by reading order (top-to-bottom, left-to-right)."""
     sorted_data = {"images": []}
     for image_info in ocr_data["images"]:
         sorted_blocks = sorted(image_info["text_blocks"], key=lambda b: (b["location"][1], b["location"][0]))
