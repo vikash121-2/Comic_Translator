@@ -2,6 +2,6 @@
 torch
 torchvision
 torchaudio
-python-telegram-bot --upgrade
+python-telegram-bot
 surya-ocr
 Pillow
