@@ -6,8 +6,8 @@ import json
 import torch
 import tempfile
 import traceback
-from telegram.error import BadRequest
 import asyncio
+import math
 from typing import List, Dict
 
 from PIL import Image, ImageDraw, ImageFont
@@ -26,6 +26,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import BadRequest
 
 # --- Basic Setup ---
 logging.basicConfig(
@@ -43,10 +44,8 @@ MODEL_ID = "microsoft/Florence-2-large"
 (
     MAIN_MENU,
     JSON_MAKER_CHOICE, WAITING_IMAGES_OCR, WAITING_ZIP_OCR,
-    JSON_TRANSLATE_CHOICE, WAITING_JSON_TRANSLATE_ZIP, WAITING_ZIP_TRANSLATE,
-    JSON_DIVIDE_CHOICE, WAITING_JSON_DIVIDE, WAITING_ZIP_DIVIDE,
-) = range(10)
-
+    # ... add other states as needed
+) = range(4)
 
 # --- Load Florence-2 model ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -57,11 +56,53 @@ try:
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
     logger.info("Florence-2 model loaded successfully.")
 except Exception as e:
-    logger.critical(f"Critical Error: Could not load the Florence-2 model. Error: {e}")
+    logger.critical(f"Critical Error: Could not load model. Error: {e}")
     exit(1)
 
 
 # --- Helper & Utility Functions ---
+
+def slice_image_if_needed(image_path: str, temp_dir: str, max_aspect_ratio: float = 2.0) -> List[str]:
+    """
+    Checks if an image is too tall. If so, slices it into smaller chunks.
+    Returns a list of paths to the processed images (either the original or the new chunks).
+    """
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+            if width == 0 or height == 0: return [image_path] # Avoid division by zero
+
+            aspect_ratio = height / width
+            if aspect_ratio > max_aspect_ratio:
+                logger.info(f"Image {os.path.basename(image_path)} has high aspect ratio ({aspect_ratio:.2f}). Slicing...")
+                
+                chunk_paths = []
+                # Make each chunk roughly square
+                chunk_height = width 
+                num_chunks = math.ceil(height / chunk_height)
+                
+                for i in range(num_chunks):
+                    top = i * chunk_height
+                    bottom = min((i + 1) * chunk_height, height)
+                    
+                    box = (0, top, width, bottom)
+                    chunk = img.crop(box)
+                    
+                    base_name, ext = os.path.splitext(os.path.basename(image_path))
+                    chunk_filename = f"{base_name}_chunk_{i}{ext}"
+                    chunk_path = os.path.join(temp_dir, chunk_filename)
+                    
+                    chunk.save(chunk_path)
+                    chunk_paths.append(chunk_path)
+                
+                logger.info(f"Sliced into {len(chunk_paths)} chunks.")
+                return chunk_paths
+            else:
+                # Image is fine, return its original path in a list
+                return [image_path]
+    except Exception as e:
+        logger.error(f"Could not slice image {image_path}: {e}")
+        return [image_path] # Return original path on failure
 
 def get_ocr_results(image_paths: List[str]) -> Dict:
     # This function remains the same
@@ -93,17 +134,17 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
     return results
 
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
+    # This function is unchanged
     if 'temp_dir' in context.user_data:
         context.user_data['temp_dir'].cleanup()
         del context.user_data['temp_dir']
     context.user_data.pop('image_paths', None)
     context.user_data.pop('json_data', None)
 
-
 # --- Main Menu & Core Navigation ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the full main menu and safely handles callbacks."""
+    # This function is unchanged
     keyboard = [
         [InlineKeyboardButton("📝 Json maker", callback_data="main_json_maker")],
         [InlineKeyboardButton("🎨 json To Comic translate", callback_data="main_translate")],
@@ -111,38 +152,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         [InlineKeyboardButton("🌐 Choose ocr language", callback_data="main_language")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
+    
     message_text = "Welcome! Please choose an option:"
     if update.message:
         await update.message.reply_text(message_text, reply_markup=reply_markup)
     elif update.callback_query:
         query = update.callback_query
         try:
-            # This will only succeed if the query hasn't been answered yet.
             await query.answer()
         except BadRequest:
-            # This happens if the query was already answered in a previous step.
-            # We can safely ignore it and just continue to draw the menu.
             logger.info("Callback query already answered, ignoring.")
-
-        # Avoid editing the message if it's already the menu to prevent flicker
+        
         if query.message.text != message_text or query.message.reply_markup != reply_markup:
             await query.edit_message_text(message_text, reply_markup=reply_markup)
-
     return MAIN_MENU
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Operation cancelled.")
-    cleanup_user_data(context)
-    return ConversationHandler.END
-
 
 # --- 1. Json Maker Feature ---
 
 async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # This function is unchanged
+    # Unchanged
     query = update.callback_query
     keyboard = [
         [
@@ -157,7 +185,7 @@ async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return JSON_MAKER_CHOICE
 
 async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # This function is unchanged
+    # Unchanged
     query = update.callback_query
     context.user_data['temp_dir'] = tempfile.TemporaryDirectory()
     context.user_data['image_paths'] = []
@@ -166,7 +194,7 @@ async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_
     return WAITING_IMAGES_OCR
 
 async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # This function is unchanged
+    # Unchanged
     try:
         temp_dir_path = context.user_data['temp_dir'].name
         image_paths = context.user_data['image_paths']
@@ -202,18 +230,30 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return WAITING_IMAGES_OCR
 
 async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # This function is unchanged
+    """
+    Processes all collected images, slicing them if necessary before OCR.
+    """
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Processing images...")
+    await query.edit_message_text("Analyzing and processing images...")
     
-    image_paths = context.user_data.get('image_paths', [])
-    if not image_paths:
+    user_image_paths = context.user_data.get('image_paths', [])
+    temp_dir_path = context.user_data['temp_dir'].name
+    if not user_image_paths:
         await query.edit_message_text("You didn't send any images! Please start over.")
         cleanup_user_data(context)
         return await start(update, context)
 
-    ocr_data = get_ocr_results(image_paths)
+    # --- NEW: Slicing Logic ---
+    all_image_chunks = []
+    for img_path in user_image_paths:
+        chunks = slice_image_if_needed(img_path, temp_dir_path)
+        all_image_chunks.extend(chunks)
+    # --- END NEW ---
+
+    await query.edit_message_text(f"Processing {len(all_image_chunks)} image(s)/chunk(s)...")
+
+    ocr_data = get_ocr_results(all_image_chunks) # Pass the chunks to the OCR function
     final_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
     
     total_text_blocks = sum(len(img["text_blocks"]) for img in final_json["images"])
@@ -225,7 +265,6 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
         await asyncio.sleep(3)
         return await start(update, context)
 
-    temp_dir_path = context.user_data['temp_dir'].name
     json_path = os.path.join(temp_dir_path, "extracted_text.json")
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(final_json, f, ensure_ascii=False, indent=4)
@@ -235,30 +274,27 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     cleanup_user_data(context)
     return await start(update, context)
 
-# Placeholder functions for other features will be added/restored below
-
+# --- Placeholder functions for other features ---
 async def not_implemented_yet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Generic handler for features that are not fully built out yet."""
     query = update.callback_query
     await query.answer("This feature is not yet implemented.", show_alert=True)
     return MAIN_MENU
     
 async def language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Informational menu for language selection."""
     query = update.callback_query
     keyboard = [[InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.answer()
     await query.edit_message_text(
-        "The current OCR model (Florence-2) is multilingual and detects language automatically. No selection is needed.",
+        "The current OCR model (Florence-2) automatically detects language.",
         reply_markup=reply_markup
     )
     return MAIN_MENU
 
-
 # --- Main Application Setup ---
 
 def main() -> None:
+    # Unchanged
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("Error: Please replace 'YOUR_BOT_TOKEN_HERE' with your bot token.")
         return
@@ -269,23 +305,21 @@ def main() -> None:
         entry_points=[CommandHandler("start", start)],
         states={
             MAIN_MENU: [
-                # RESTORED: Handlers for all main menu buttons
                 CallbackQueryHandler(json_maker_menu, pattern="^main_json_maker$"),
-                CallbackQueryHandler(not_implemented_yet, pattern="^main_translate$"), # Placeholder
-                CallbackQueryHandler(not_implemented_yet, pattern="^main_divide$"),   # Placeholder
+                CallbackQueryHandler(not_implemented_yet, pattern="^main_translate$"),
+                CallbackQueryHandler(not_implemented_yet, pattern="^main_divide$"),
                 CallbackQueryHandler(language_menu, pattern="^main_language$"),
                 CallbackQueryHandler(start, pattern="^main_menu_start$"), 
             ],
             JSON_MAKER_CHOICE: [
                 CallbackQueryHandler(json_maker_prompt_image, pattern="^jm_image$"),
-                CallbackQueryHandler(not_implemented_yet, pattern="^jm_zip$"), # Placeholder for zip
+                CallbackQueryHandler(not_implemented_yet, pattern="^jm_zip$"),
                 CallbackQueryHandler(start, pattern="^main_menu_start$"),
             ],
             WAITING_IMAGES_OCR: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, collect_images),
                 CallbackQueryHandler(process_collected_images, pattern="^jm_process_images$"),
             ],
-            # Add other states here as you build them out
         },
         fallbacks=[CommandHandler("start", start)],
     )
