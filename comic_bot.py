@@ -115,11 +115,11 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
             # Refined parameters for easyocr to catch more text
             read_params = {
                 'detail': 1,
-                'contrast_ths': 0.05, # Lower threshold to detect lower contrast text
-                'adjust_contrast': 0.5, # Moderate contrast adjustment
-                'text_threshold': 0.6, # Slightly higher confidence for initial detection
-                'low_text': 0.3, # Adjust sensitivity for low confidence text
-                'link_threshold': 0.8 # Higher link threshold for connecting words
+                'contrast_ths': 0.05,
+                'adjust_contrast': 0.5,
+                'text_threshold': 0.6,
+                'low_text': 0.3,
+                'link_threshold': 0.8
             }
             
             output_ja = reader_ja.readtext(preprocessed_image, **read_params)
@@ -132,34 +132,27 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
             
             # ADVANCED DE-DUPLICATION using IoU and text similarity
             for (bbox_new, text_new, prob_new) in combined_output:
-                new_block_added = True
-                simple_bbox_new = [int(p[0]) for p in bbox_new[0]] + [int(p[1]) for p in bbox_new[0]] # Placeholder for simple conversion
-                
-                # Correct simple_bbox_new conversion for 4 points
+                # --- THIS IS THE CORRECTED CODE ---
                 x_coords_new = [int(p[0]) for p in bbox_new]
                 y_coords_new = [int(p[1]) for p in bbox_new]
                 simple_bbox_new = [min(x_coords_new), min(y_coords_new), max(x_coords_new), max(y_coords_new)]
+                # --- END OF FIX ---
 
-
+                new_block_added = True
                 for i, existing_block in enumerate(final_text_blocks):
                     bbox_existing = existing_block["location"]
                     text_existing = existing_block["text"]
                     
                     iou = calculate_iou(simple_bbox_new, bbox_existing)
                     
-                    # Simple text similarity check (could be improved with Levenshtein distance for robustness)
                     text_similarity = 0.0
                     if len(text_new) > 0 and len(text_existing) > 0:
-                        # Case-insensitive comparison for similarity
                         min_len = min(len(text_new), len(text_existing))
                         matches = sum(1 for a, b in zip(text_new.lower(), text_existing.lower()) if a == b)
                         if min_len > 0:
                             text_similarity = matches / max(len(text_new), len(text_existing))
 
-                    # If high overlap AND similar text, consider it a duplicate
-                    if iou > 0.6 and text_similarity > 0.7: # Tunable thresholds
-                        # Keep the one with higher confidence (if prob is comparable, otherwise prioritize one language)
-                        # For simplicity, we'll just skip adding the new one if a very similar one exists
+                    if iou > 0.6 and text_similarity > 0.7:
                         new_block_added = False
                         break
                 
