@@ -316,6 +316,7 @@ async def json_translate_collect_images(update: Update, context: ContextTypes.DE
     return WAITING_IMAGES_TRANSLATE
 
 async def json_translate_process_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Draws text on all collected images and sends them back."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Processing translation for all images...")
@@ -329,33 +330,62 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
         return await start(update, context)
 
     try:
+        # Using a default font size, can be adjusted
         font = ImageFont.truetype(FONT_PATH, 20)
     except IOError:
         await context.bot.send_message(chat_id=query.message.chat.id, text=f"⚠️ Error: Font file '{FONT_PATH}' not found.")
         cleanup_user_data(context)
         return await start(update, context)
 
-    images_json_data = json_data.get("images", [])
+    # Smartly find the list of images, whether the JSON is from a zip or single images
+    images_json_data = []
+    if "images" in json_data:
+        images_json_data = json_data["images"]
+    elif "folders" in json_data and len(json_data["folders"]) > 0:
+        # If from a zip, just use the images from the first folder
+        images_json_data = json_data["folders"][0].get("images", [])
+
+    if not images_json_data:
+        await query.edit_message_text("Could not find an 'images' list in your JSON file. Please check the file format.")
+        cleanup_user_data(context)
+        return await start(update, context)
     
+    images_processed = 0
     for image_info in images_json_data:
         image_name = image_info.get("image_name")
+        # Check if this image was one of the ones the user uploaded
         if image_name in received_images:
             image_path = received_images[image_name]
-            with Image.open(image_path).convert("RGB") as img:
-                draw = ImageDraw.Draw(img)
+            
+            with Image.open(image_path).convert("RGBA") as img:
+                # Create a transparent layer to draw on
+                txt_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
+                draw = ImageDraw.Draw(txt_layer)
+                
                 for block in image_info.get("text_blocks", []):
                     text = block["text"]
                     loc = block["location"]
+                    
+                    # Draw a white rectangle to cover the old text, then the new text
                     draw.rectangle(loc, fill="white")
                     draw.text((loc[0], loc[1]), text, font=font, fill="black")
                 
+                # Composite the text layer onto the original image
+                combined_img = Image.alpha_composite(img, txt_layer).convert("RGB")
+                
+                # Send the processed image back to the user
                 bio = io.BytesIO()
                 bio.name = f"translated_{image_name}"
-                img.save(bio, 'JPEG')
+                combined_img.save(bio, 'JPEG')
                 bio.seek(0)
                 await context.bot.send_document(chat_id=query.message.chat.id, document=bio)
+                images_processed += 1
 
-    await context.bot.send_message(chat_id=query.message.chat.id, text="Translation complete!")
+    if images_processed == 0:
+        await context.bot.send_message(chat_id=query.message.chat.id, text="Warning: No matching images found between your JSON file and the images you uploaded. Please check the 'image_name' fields.")
+    else:
+        await context.bot.send_message(chat_id=query.message.chat.id, text="Translation complete!")
+        
     cleanup_user_data(context)
     return await start(update, context)
 
