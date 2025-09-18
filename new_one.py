@@ -29,13 +29,16 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest
 
+# Allow loading of truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+# --- Basic Setup ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# --- Global Variables & Configuration ---
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
 FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
@@ -66,16 +69,49 @@ except Exception as e:
 
 # --- Helper & Utility Functions ---
 
-def get_ocr_results(image_paths: List[str]):
-    # ... (This function is complete and doesn't need changes)
-    pass
-
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
     if 'temp_dir_obj' in context.user_data:
         context.user_data['temp_dir_obj'].cleanup()
         del context.user_data['temp_dir_obj']
     context.user_data.pop('image_paths', None)
     context.user_data.pop('json_data', None)
+
+def get_ocr_results(image_paths: List[str]) -> Dict:
+    results = {}
+    for image_path in image_paths:
+        image_name = os.path.basename(image_path)
+        try:
+            # Run all readers and combine results
+            output_ja = reader_ja.readtext(image_path)
+            output_ko = reader_ko.readtext(image_path)
+            output_sim = reader_sim.readtext(image_path)
+            output_tra = reader_tra.readtext(image_path)
+            combined_output = output_ja + output_ko + output_sim + output_tra
+            
+            unique_results = {}
+            for (bbox, text, prob) in combined_output:
+                box_key = (text, int(bbox[0][1] / 10), int(bbox[0][0] / 10))
+                if box_key not in unique_results:
+                    unique_results[box_key] = (bbox, text, prob)
+
+            text_blocks = []
+            for (bbox, text, prob) in unique_results.values():
+                x_coords = [int(p[0]) for p in bbox]
+                y_coords = [int(p[1]) for p in bbox]
+                simple_bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                text_blocks.append({"text": text, "location": simple_bbox})
+            results[image_name] = text_blocks
+        except Exception as e:
+            logger.error(f"Failed to process image {image_path}: {e}")
+            results[image_name] = []
+    return results
+
+def sort_text_blocks(ocr_data: Dict) -> Dict:
+    sorted_data = {"images": []}
+    for image_info in ocr_data["images"]:
+        sorted_blocks = sorted(image_info["text_blocks"], key=lambda b: (b["location"][1], b["location"][0]))
+        sorted_data["images"].append({"image_name": image_info["image_name"], "text_blocks": sorted_blocks})
+    return sorted_data
 
 # --- Main Menu & Core Navigation ---
 
@@ -99,7 +135,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return MAIN_MENU
 
 async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Helper function to go back to the main menu from a sub-menu."""
     cleanup_user_data(context)
     return await start(update, context)
 
@@ -117,15 +152,112 @@ async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.edit_message_text("How would you like to provide source files?", reply_markup=reply_markup)
     return JSON_MAKER_CHOICE
 
-# ... (json maker functions: prompt, collect, process, etc. remain here) ...
+async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    context.user_data['temp_dir_obj'] = tempfile.TemporaryDirectory()
+    context.user_data['image_paths'] = []
+    await query.answer()
+    await query.edit_message_text("Please send your images. Press 'Done Uploading' when finished.")
+    return WAITING_IMAGES_OCR
 
+async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        temp_dir_path = context.user_data['temp_dir_obj'].name
+        image_paths = context.user_data['image_paths']
+    except KeyError:
+        await update.message.reply_text("Something went wrong. Please start over with /start.")
+        cleanup_user_data(context)
+        return ConversationHandler.END
+
+    file_to_download, file_name = (None, None)
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file_to_download = await photo.get_file()
+        file_name = f"{photo.file_id}.jpg"
+    elif update.message.document and update.message.document.mime_type.startswith('image/'):
+        doc = update.message.document
+        file_to_download = await doc.get_file()
+        file_name = doc.file_name
+    else:
+        await update.message.reply_text("That doesn't seem to be an image. Please send a photo or image file.")
+        return WAITING_IMAGES_OCR
+
+    file_path = os.path.join(temp_dir_path, file_name)
+    await file_to_download.download_to_drive(file_path)
+    image_paths.append(file_path)
+
+    keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="jm_process_images")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(f"Image {len(image_paths)} received. Send another, or press Done.", reply_markup=reply_markup)
+    return WAITING_IMAGES_OCR
+
+async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Processing images...")
+    
+    image_paths = context.user_data.get('image_paths', [])
+    if not image_paths:
+        await query.edit_message_text("You didn't send any images! Please start over.")
+        cleanup_user_data(context)
+        return await start(update, context)
+
+    ocr_data = get_ocr_results(image_paths)
+    raw_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
+    final_json = sort_text_blocks(raw_json)
+    
+    if sum(len(img["text_blocks"]) for img in final_json["images"]) == 0:
+        await query.edit_message_text("I couldn't extract any text. Returning to the main menu.")
+        cleanup_user_data(context)
+        return await start(update, context)
+
+    temp_dir_path = context.user_data['temp_dir_obj'].name
+    json_path = os.path.join(temp_dir_path, "extracted_text.json")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(final_json, f, ensure_ascii=False, indent=4)
+        
+    await context.bot.send_document(chat_id=query.message.chat.id, document=open(json_path, 'rb'))
+    cleanup_user_data(context)
+    return await start(update, context)
+
+async def json_maker_prompt_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Please send the zip file.")
+    return WAITING_ZIP_OCR
+
+async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Processing zip file...")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        zip_file = await update.message.document.get_file()
+        zip_path = os.path.join(temp_dir, "input.zip")
+        await zip_file.download_to_drive(zip_path)
+        extract_path = os.path.join(temp_dir, "extracted")
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            z.extractall(extract_path)
+        
+        final_json = {"folders": []}
+        for folder_name in sorted(os.listdir(extract_path)):
+            folder_path = os.path.join(extract_path, folder_name)
+            if os.path.isdir(folder_path):
+                image_paths = [os.path.join(folder_path, f) for f in sorted(os.listdir(folder_path)) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                if image_paths:
+                    ocr_data = get_ocr_results(image_paths)
+                    raw_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
+                    sorted_json = sort_text_blocks(raw_json)
+                    final_json["folders"].append({"folder_name": folder_name, "images": sorted_json["images"]})
+        
+        json_path = os.path.join(temp_dir, "extracted_text_from_zip.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(final_json, f, ensure_ascii=False, indent=4)
+        await update.message.reply_document(document=open(json_path, 'rb'))
+    return await start(update, context)
 
 # --- 2. Json To Comic Translate Feature ---
 
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     keyboard = [
-        # The image upload for this is complex, so we'll focus on the main zip feature
         [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jt_zip")],
         [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
     ]
@@ -159,7 +291,6 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
         return await start(update, context)
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Download and extract the original zip
         zip_file = await update.message.document.get_file()
         input_zip_path = os.path.join(temp_dir, "input.zip")
         await zip_file.download_to_drive(input_zip_path)
@@ -169,7 +300,6 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
         with zipfile.ZipFile(input_zip_path, 'r') as z:
             z.extractall(extract_path)
 
-        # Process folders and images based on JSON
         for folder_data in json_data.get("folders", []):
             folder_name = folder_data["folder_name"]
             output_folder_path = os.path.join(output_path, folder_name)
@@ -185,15 +315,14 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
                         for block in image_data.get("text_blocks", []):
                             text = block["text"]
                             loc = block["location"]
-                            # Draw text with a white outline for visibility
-                            draw.text((loc[0], loc[1]), text, font=font, fill=(0,0,0,255), stroke_width=1, stroke_fill=(255,255,255,255))
+                            draw.rectangle(loc, fill=(255,255,255,255))
+                            draw.text((loc[0], loc[1]), text, font=font, fill=(0,0,0,255))
                         
                         combined_img = Image.alpha_composite(img, txt_layer).convert("RGB")
                         combined_img.save(os.path.join(output_folder_path, image_name))
                 else:
                     logger.warning(f"Image not found, skipping: {original_image_path}")
         
-        # Create and send the new zip
         output_zip_name = os.path.join(temp_dir, "translated_comic")
         shutil.make_archive(output_zip_name, 'zip', output_path)
         await update.message.reply_document(document=open(f"{output_zip_name}.zip", 'rb'))
@@ -233,7 +362,6 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
     json_data = context.user_data['json_data']
     
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Download and extract zip to be modified in-place
         zip_file = await update.message.document.get_file()
         input_zip_path = os.path.join(temp_dir, "input.zip")
         await zip_file.download_to_drive(input_zip_path)
@@ -242,30 +370,26 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
         with zipfile.ZipFile(input_zip_path, 'r') as z:
             z.extractall(extract_path)
 
-        # Process folders based on JSON
         for folder_data in json_data.get("folders", []):
             folder_name = folder_data["folder_name"]
             current_folder_path = os.path.join(extract_path, folder_name)
             
             if os.path.isdir(current_folder_path):
-                # 1. Create and save the smaller JSON for this folder
                 folder_specific_json = {"images": folder_data.get("images", [])}
                 folder_json_path = os.path.join(current_folder_path, f"{folder_name}.json")
                 with open(folder_json_path, 'w', encoding='utf-8') as f:
                     json.dump(folder_specific_json, f, ensure_ascii=False, indent=4)
                 
-                # 2. Mask the images in this folder
                 for image_data in folder_data.get("images", []):
                     image_name = image_data["image_name"]
                     image_path = os.path.join(current_folder_path, image_name)
                     if os.path.exists(image_path):
-                        with Image.open(image_path) as img:
+                        with Image.open(image_path).convert("RGB") as img:
                             draw = ImageDraw.Draw(img)
                             for block in image_data.get("text_blocks", []):
                                 draw.rectangle(block["location"], fill="black")
                             img.save(image_path)
         
-        # Create and send the new zip from the modified extracted folder
         output_zip_name = os.path.join(temp_dir, "divided_masked_comic")
         shutil.make_archive(output_zip_name, 'zip', extract_path)
         await update.message.reply_document(document=open(f"{output_zip_name}.zip", 'rb'))
@@ -277,11 +401,6 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
 
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
-
-    # NOTE: All the functions for the Json Maker (jm_image, jm_zip) are assumed to be here
-    # from the previous script. They are omitted for brevity but are required.
-    from previous_scripts import json_maker_prompt_image, collect_images, process_collected_images, json_maker_process_zip
-
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -293,13 +412,14 @@ def main() -> None:
             ],
             JSON_MAKER_CHOICE: [
                 CallbackQueryHandler(json_maker_prompt_image, pattern="^jm_image$"),
-                CallbackQueryHandler(json_maker_process_zip, pattern="^jm_zip$"), # Assuming this exists
+                CallbackQueryHandler(json_maker_prompt_zip, pattern="^jm_zip$"),
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
             ],
             WAITING_IMAGES_OCR: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, collect_images),
                 CallbackQueryHandler(process_collected_images, pattern="^jm_process_images$"),
             ],
+            WAITING_ZIP_OCR: [MessageHandler(filters.Document.ZIP, json_maker_process_zip)],
             # States for JSON Translate
             JSON_TRANSLATE_CHOICE: [
                 CallbackQueryHandler(json_translate_prompt_json, pattern="^jt_zip$"),
@@ -317,10 +437,8 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("start", start)],
     )
-
     application.add_handler(conv_handler)
     application.run_polling()
-
 
 if __name__ == "__main__":
     main()
