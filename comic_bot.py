@@ -52,10 +52,7 @@ try:
     logger.info("Loaded Japanese model.")
     reader_ko = easyocr.Reader(['ko', 'en'], gpu=use_gpu)
     logger.info("Loaded Korean model.")
-    
-    # CORRECTED: Changed use_gpus to use_gpu
     reader_sim = easyocr.Reader(['ch_sim', 'en'], gpu=use_gpu)
-    
     logger.info("Loaded Simplified Chinese model.")
     reader_tra = easyocr.Reader(['ch_tra', 'en'], gpu=use_gpu)
     logger.info("Loaded Traditional Chinese model.")
@@ -66,15 +63,20 @@ except Exception as e:
     logger.critical(traceback.format_exc())
     exit(1)
 
+# --- Helper & Utility Functions ---
+
 def preprocess_for_ocr(image_path: str) -> np.ndarray:
+    """
+    NEW: Uses a more gentle grayscale conversion for preprocessing.
+    """
     try:
         image = cv2.imread(image_path)
+        # Convert to grayscale - this is often more effective than harsh thresholding
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        processed_image = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        return processed_image
-    except Exception:
+        return gray
+    except Exception as e:
+        logger.error(f"OpenCV preprocessing failed for {image_path}: {e}")
+        # Fallback to the original image if preprocessing fails
         return cv2.imread(image_path)
 
 def get_ocr_results(image_paths: List[str]) -> Dict:
@@ -84,10 +86,19 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
         try:
             preprocessed_image = preprocess_for_ocr(image_path)
             
-            output_ja = reader_ja.readtext(preprocessed_image)
-            output_ko = reader_ko.readtext(preprocessed_image)
-            output_sim = reader_sim.readtext(preprocessed_image)
-            output_tra = reader_tra.readtext(preprocessed_image)
+            # NEW: Add parameters to fine-tune text detection
+            read_params = {
+                'detail': 1,
+                'contrast_ths': 0.15,
+                'adjust_contrast': 0.6,
+                'text_threshold': 0.5
+            }
+            
+            # Run all readers with the new parameters
+            output_ja = reader_ja.readtext(preprocessed_image, **read_params)
+            output_ko = reader_ko.readtext(preprocessed_image, **read_params)
+            output_sim = reader_sim.readtext(preprocessed_image, **read_params)
+            output_tra = reader_tra.readtext(preprocessed_image, **read_params)
             combined_output = output_ja + output_ko + output_sim + output_tra
             
             unique_results = {}
@@ -117,6 +128,8 @@ def sort_text_blocks(ocr_data: Dict) -> Dict:
         sorted_blocks = sorted(image_info["text_blocks"], key=lambda b: (b["location"][1], b["location"][0]))
         sorted_data["images"].append({"image_name": image_info["image_name"], "text_blocks": sorted_blocks})
     return sorted_data
+
+# ... (The rest of the script, including cleanup_user_data, start, menus, and main, remains the same) ...
 
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
     if 'temp_dir' in context.user_data:
@@ -240,6 +253,7 @@ def main() -> None:
     )
     application.add_handler(conv_handler)
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
