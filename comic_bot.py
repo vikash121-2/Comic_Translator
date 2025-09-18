@@ -73,15 +73,10 @@ def preprocess_for_ocr(image_path: str) -> np.ndarray:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
         # Apply a Gaussian blur to reduce noise, then an unsharp mask to sharpen edges
-        # This can help emphasize text edges without harsh thresholding
         blurred = cv2.GaussianBlur(gray, (0, 0), 3)
         sharpened = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
         
-        # Alternatively, for very dark/light text, you might try a local contrast stretch
-        # clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        # enhanced_image = clahe.apply(gray)
-        
-        return sharpened # Or gray, or enhanced_image, depending on test results
+        return sharpened
     except Exception as e:
         logger.error(f"OpenCV preprocessing failed for {image_path}: {e}")
         return cv2.imread(image_path)
@@ -105,7 +100,11 @@ def calculate_iou(box1: List[int], box2: List[int]) -> float:
         return 0.0
     return intersection_area / union_area
 
-def get_ocr_results(image_paths: List[str]) -> Dict:
+def get_ocr_results(image_paths: List[str], min_confidence: float = 0.3) -> Dict:
+    """
+    Runs OCR on a list of images using all easyocr readers, combines results,
+    de-duplicates based on IoU and text similarity, and filters by confidence.
+    """
     results = {}
     for image_path in image_paths:
         image_name = os.path.basename(image_path)
@@ -114,55 +113,72 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
             
             # Refined parameters for easyocr to catch more text
             read_params = {
-                'detail': 1,
-                'contrast_ths': 0.05,
-                'adjust_contrast': 0.5,
-                'text_threshold': 0.6,
-                'low_text': 0.3,
-                'link_threshold': 0.8
+                'detail': 1, # Return bounding box and confidence score
+                'contrast_ths': 0.05, # Lower threshold to detect lower contrast text
+                'adjust_contrast': 0.5, # Moderate contrast adjustment
+                'text_threshold': 0.6, # Confidence for initial detection
+                'low_text': 0.3, # Adjust sensitivity for low confidence text
+                'link_threshold': 0.8 # Higher link threshold for connecting words
             }
             
             output_ja = reader_ja.readtext(preprocessed_image, **read_params)
             output_ko = reader_ko.readtext(preprocessed_image, **read_params)
             output_sim = reader_sim.readtext(preprocessed_image, **read_params)
             output_tra = reader_tra.readtext(preprocessed_image, **read_params)
+            
             combined_output = output_ja + output_ko + output_sim + output_tra
             
-            final_text_blocks = []
+            # Filter by minimum confidence first
+            filtered_output = [item for item in combined_output if item[2] >= min_confidence]
             
-            # ADVANCED DE-DUPLICATION using IoU and text similarity
-            for (bbox_new, text_new, prob_new) in combined_output:
-                # --- THIS IS THE CORRECTED CODE ---
+            final_text_blocks_raw = [] # Store bbox_new, text_new, prob_new
+            
+            # ADVANCED DE-DUPLICATION using IoU, text similarity, and confidence
+            for (bbox_new, text_new, prob_new) in filtered_output:
                 x_coords_new = [int(p[0]) for p in bbox_new]
                 y_coords_new = [int(p[1]) for p in bbox_new]
                 simple_bbox_new = [min(x_coords_new), min(y_coords_new), max(x_coords_new), max(y_coords_new)]
-                # --- END OF FIX ---
 
-                new_block_added = True
-                for i, existing_block in enumerate(final_text_blocks):
-                    bbox_existing = existing_block["location"]
-                    text_existing = existing_block["text"]
+                is_duplicate = False
+                for i, existing_block_tuple in enumerate(final_text_blocks_raw):
+                    (bbox_existing_raw, text_existing, prob_existing) = existing_block_tuple
                     
-                    iou = calculate_iou(simple_bbox_new, bbox_existing)
+                    x_coords_existing = [int(p[0]) for p in bbox_existing_raw]
+                    y_coords_existing = [int(p[1]) for p in bbox_existing_raw]
+                    simple_bbox_existing = [min(x_coords_existing), min(y_coords_existing), max(x_coords_existing), max(y_coords_existing)]
+
+                    iou = calculate_iou(simple_bbox_new, simple_bbox_existing)
                     
                     text_similarity = 0.0
                     if len(text_new) > 0 and len(text_existing) > 0:
                         min_len = min(len(text_new), len(text_existing))
                         matches = sum(1 for a, b in zip(text_new.lower(), text_existing.lower()) if a == b)
-                        if min_len > 0:
+                        if max(len(text_new), len(text_existing)) > 0: # Avoid division by zero
                             text_similarity = matches / max(len(text_new), len(text_existing))
 
-                    if iou > 0.6 and text_similarity > 0.7:
-                        new_block_added = False
+                    # If high overlap AND similar text
+                    if iou > 0.5 and text_similarity > 0.7: # Tunable IoU and Text similarity thresholds
+                        is_duplicate = True
+                        # If new block has higher confidence, replace existing one
+                        if prob_new > prob_existing:
+                            final_text_blocks_raw[i] = (bbox_new, text_new, prob_new)
                         break
                 
-                if new_block_added:
-                    final_text_blocks.append({
-                        "text": text_new,
-                        "location": simple_bbox_new
-                    })
+                if not is_duplicate:
+                    final_text_blocks_raw.append((bbox_new, text_new, prob_new))
 
-            results[image_name] = final_text_blocks
+            # Convert to desired JSON format
+            formatted_blocks = []
+            for (bbox_raw, text, prob) in final_text_blocks_raw:
+                x_coords = [int(p[0]) for p in bbox_raw]
+                y_coords = [int(p[1]) for p in bbox_raw]
+                simple_bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                formatted_blocks.append({
+                    "text": text,
+                    "location": simple_bbox
+                })
+
+            results[image_name] = formatted_blocks
             logger.info(f"Successfully processed {image_name} with all easyocr models.")
         except Exception as e:
             logger.error(f"Failed to process image {image_path} with easyocr: {e}")
@@ -172,23 +188,51 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
 
 
 def sort_text_blocks(ocr_data: Dict) -> Dict:
+    """
+    Sorts text blocks in each image by reading order (top-to-bottom, then left-to-right).
+    Also includes a small buffer for vertical alignment to treat closely aligned lines as one.
+    """
     sorted_data = {"images": []}
     for image_info in ocr_data["images"]:
-        # Sort blocks based on their top-left corner (y-coordinate, then x-coordinate)
-        sorted_blocks = sorted(image_info["text_blocks"], key=lambda b: (b["location"][1], b["location"][0]))
+        text_blocks = image_info["text_blocks"]
+        
+        # Group blocks that are on roughly the same horizontal line
+        lines = []
+        line_buffer = 10 # Pixels to consider blocks on the same line
+        
+        for block in text_blocks:
+            added_to_line = False
+            for line in lines:
+                # Check if the block's y-coordinate is within the line's y-range
+                if abs(block["location"][1] - line[0]["location"][1]) < line_buffer:
+                    line.append(block)
+                    added_to_line = True
+                    break
+            if not added_to_line:
+                lines.append([block])
+        
+        final_sorted_blocks = []
+        # Sort lines by their average y-coordinate
+        lines.sort(key=lambda line: sum(b["location"][1] for b in line) / len(line))
+        
+        for line in lines:
+            # Sort blocks within each line by x-coordinate
+            line.sort(key=lambda block: block["location"][0])
+            final_sorted_blocks.extend(line)
+
         sorted_data["images"].append({
             "image_name": image_info["image_name"],
-            "text_blocks": sorted_blocks
+            "text_blocks": final_sorted_blocks
         })
     return sorted_data
+
+# ... (The rest of the script, including cleanup_user_data, start, menus, and main, remains the same) ...
 
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
     if 'temp_dir' in context.user_data:
         context.user_data['temp_dir'].cleanup()
         del context.user_data['temp_dir']
     context.user_data.pop('image_paths', None)
-
-# --- Main Menu & Core Navigation ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [[InlineKeyboardButton("📝 Json maker", callback_data="main_json_maker")]]
@@ -205,8 +249,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if query.message.text != message_text or query.message.reply_markup != reply_markup:
             await query.edit_message_text(message_text, reply_markup=reply_markup)
     return MAIN_MENU
-
-# --- 1. Json Maker Feature ---
 
 async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -235,7 +277,6 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Something went wrong. Please start over with /start.")
         cleanup_user_data(context)
         return ConversationHandler.END
-
     file_to_download, file_name = (None, None)
     if update.message.photo:
         photo = update.message.photo[-1]
@@ -248,14 +289,11 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         await update.message.reply_text("That doesn't seem to be an image. Please send a photo or image file.")
         return WAITING_IMAGES_OCR
-
     file_path = os.path.join(temp_dir_path, file_name)
     await file_to_download.download_to_drive(file_path)
     image_paths.append(file_path)
-
     keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="jm_process_images")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_text(
         f"Image {len(image_paths)} received. Send another, or press Done.",
         reply_markup=reply_markup
@@ -273,7 +311,8 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
         cleanup_user_data(context)
         return await start(update, context)
 
-    ocr_data = get_ocr_results(image_paths)
+    # NEW: Pass min_confidence to filter out low-confidence detections
+    ocr_data = get_ocr_results(image_paths, min_confidence=0.35) # You can adjust this value (0.35 is a good starting point)
     raw_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
     
     final_json = sort_text_blocks(raw_json)
@@ -281,7 +320,7 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     total_text_blocks = sum(len(img["text_blocks"]) for img in final_json["images"])
     if total_text_blocks == 0:
         await query.edit_message_text(
-            "I couldn't extract any text from the image(s). Returning to menu."
+            "I couldn't extract any text from the image(s). This might be due to very low confidence. Try adjusting `min_confidence` if you believe there's text. Returning to menu."
         )
         cleanup_user_data(context)
         await asyncio.sleep(4)
