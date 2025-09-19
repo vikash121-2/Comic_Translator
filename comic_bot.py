@@ -81,7 +81,7 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
         try:
             image = Image.open(image_path).convert("RGB")
             
-            # Use a more robust detection method from easyocr
+            # Use easyocr's readtext to get boxes and rough text
             detected_results = detector.readtext(np.array(image), detail=1, paragraph=False)
             if not detected_results:
                 results[image_name] = []
@@ -89,9 +89,12 @@ def get_ocr_results(image_paths: List[str]) -> Dict:
 
             text_blocks = []
             for (box_points, text, prob) in detected_results:
-                x_coords = [p[0] for p in box_points]
-                y_coords = [p[1] for p in box_points]
+                # --- THIS IS THE FIX ---
+                # Convert all coordinates to standard Python integers immediately
+                x_coords = [int(p[0]) for p in box_points]
+                y_coords = [int(p[1]) for p in box_points]
                 simple_bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                # --- END OF FIX ---
                 
                 # Crop the detected box and recognize text with TrOCR for higher accuracy
                 cropped_image = image.crop(simple_bbox)
