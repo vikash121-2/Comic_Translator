@@ -85,41 +85,26 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
 # ## NEW ADVANCED PREPROCESSING FUNCTION ##
 def preprocess_for_ocr(image_path: str) -> np.ndarray:
     """
-    Uses an advanced color mask to isolate black and white text from a complex background.
+    Uses a professional OCR preprocessing pipeline: Grayscale + CLAHE.
     """
     try:
-        image = cv2.imread(image_path)
+        # Read the image directly in grayscale
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise ValueError("Image could not be read from path.")
 
-        # Convert the image to HSV (Hue, Saturation, Value) color space
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-
-        # Create a mask for WHITE text (adjust V value range for brightness)
-        lower_white = np.array([0, 0, 180])
-        upper_white = np.array([180, 55, 255])
-        white_mask = cv2.inRange(hsv, lower_white, upper_white)
-
-        # Create a mask for BLACK text (adjust V value range for darkness)
-        lower_black = np.array([0, 0, 0])
-        upper_black = np.array([180, 255, 80])
-        black_mask = cv2.inRange(hsv, lower_black, upper_black)
-
-        # Combine the two masks
-        combined_mask = cv2.bitwise_or(white_mask, black_mask)
+        # Create a CLAHE object (Contrast Limited Adaptive Histogram Equalization)
+        # This is excellent for improving local contrast in images with varied lighting.
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced_image = clahe.apply(image)
         
-        # Invert the mask to get black text on a white background (optimal for OCR)
-        final_image = cv2.bitwise_not(combined_mask)
-        
-        return final_image
+        return enhanced_image
         
     except Exception as e:
         logger.error(f"Advanced OpenCV preprocessing failed for {image_path}: {e}")
-        # Fallback to a simple grayscale if the advanced method fails
-        image = cv2.imread(image_path)
-        if image is not None:
-            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        return None # Return None if fallback also fails
+        # If CLAHE fails, return the original image in grayscale as a fallback
+        fallback_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        return fallback_images
 # -------------------------------------------------------------------
 
 
