@@ -7,6 +7,7 @@ import json
 import torch
 import tempfile
 import textwrap
+from google.colab import userdata
 from typing import List, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 
@@ -30,7 +31,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from google.colab import userdata
+
 BOT_TOKEN = userdata.get('BOT_TOKEN')
 FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
