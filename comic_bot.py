@@ -7,7 +7,6 @@ import json
 import torch
 import tempfile
 import textwrap
-from google.colab import userdata
 from typing import List, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 
@@ -32,7 +31,7 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 
-BOT_TOKEN = userdata.get('BOT_TOKEN')
+BOT_TOKEN = os.('BOT_TOKEN')
 FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
 # Conversation states
