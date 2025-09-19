@@ -6,9 +6,13 @@ import shutil
 import json
 import torch
 import tempfile
+import traceback
 import textwrap
+import asyncio
+import cv2
 import numpy as np
 from typing import List, Dict
+
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 
 from telegram import (
@@ -28,43 +32,42 @@ from telegram.ext import (
 from telegram.error import BadRequest
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
 FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
-# Conversation states
+# All conversation states defined
 (
     MAIN_MENU,
-    JSON_MAKER_CHOICE, WAITING_IMAGES_OCR, WAITING_ZIP_OCR,
-    JSON_TRANSLATE_CHOICE, 
+    JSON_MAKER_CHOICE, WAITING_IMAGES_OCR, SELECT_LANGUAGE, WAITING_ZIP_OCR,
+    JSON_TRANSLATE_CHOICE,
     WAITING_JSON_TRANSLATE_IMG, WAITING_IMAGES_TRANSLATE,
     WAITING_JSON_TRANSLATE_ZIP, WAITING_ZIP_TRANSLATE,
-    JSON_DIVIDE_CHOICE, 
+    JSON_DIVIDE_CHOICE,
     WAITING_JSON_DIVIDE, WAITING_ZIP_DIVIDE,
-) = range(12)
+) = range(13)
 
-# --- Load AI Models ---
-logger.info(f"Loading all AI models...")
+# --- Load easyocr models into a dictionary ---
+logger.info(f"Loading all easyocr models...")
 try:
     import easyocr
-    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-
     use_gpu = torch.cuda.is_available()
-    device = "cuda:0" if use_gpu else "cpu"
-    logger.info(f"Using device: {device}")
+    logger.info(f"GPU available: {use_gpu}")
 
-    # 1. Load easyocr for Text Detection
-    detector = easyocr.Reader(['en'], gpu=use_gpu)
-    logger.info("EasyOCR text detector loaded successfully.")
-
-    # 2. Load TrOCR for high-accuracy Text Recognition
-    processor = TrOCRProcessor.from_pretrained('microsoft/trocr-base-printed')
-    model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-base-printed').to(device)
-    logger.info("TrOCR text recognizer loaded successfully.")
+    readers = {
+        'ja': easyocr.Reader(['ja', 'en'], gpu=use_gpu),
+        'ko': easyocr.Reader(['ko', 'en'], gpu=use_gpu),
+        'ch_sim': easyocr.Reader(['ch_sim', 'en'], gpu=use_gpu),
+        'ch_tra': easyocr.Reader(['ch_tra', 'en'], gpu=use_gpu),
+    }
+    logger.info("All easyocr models loaded successfully.")
 except Exception as e:
-    logger.critical(f"Critical Error: Could not load AI models. Error: {e}")
+    logger.critical(f"Critical Error: Could not load easyocr model. Error: {e}")
     exit(1)
 
 # --- Helper & Utility Functions ---
@@ -74,38 +77,35 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
         context.user_data['temp_dir_obj'].cleanup()
     context.user_data.clear()
 
-def get_ocr_results(image_paths: List[str]) -> Dict:
+def preprocess_for_ocr(image_path: str) -> np.ndarray:
+    try:
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if image is None: raise ValueError("Image could not be read.")
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced_image = clahe.apply(image)
+        return enhanced_image
+    except Exception as e:
+        logger.error(f"OpenCV preprocessing failed for {image_path}: {e}")
+        return cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+def get_ocr_results(image_paths: List[str], lang_code: str) -> Dict:
     results = {}
+    reader = readers.get(lang_code)
+    if not reader:
+        logger.error(f"Invalid language code '{lang_code}'")
+        return {}
     for image_path in image_paths:
         image_name = os.path.basename(image_path)
         try:
-            image = Image.open(image_path).convert("RGB")
-            
-            # Use easyocr's readtext to get boxes and rough text
-            detected_results = detector.readtext(np.array(image), detail=1, paragraph=False)
-            if not detected_results:
-                results[image_name] = []
-                continue
-
+            preprocessed_image = preprocess_for_ocr(image_path)
+            ocr_output = reader.readtext(preprocessed_image, detail=1, paragraph=False)
             text_blocks = []
-            for (box_points, text, prob) in detected_results:
-                # --- THIS IS THE FIX ---
-                # Convert all coordinates to standard Python integers immediately
-                x_coords = [int(p[0]) for p in box_points]
-                y_coords = [int(p[1]) for p in box_points]
+            for (bbox, text, prob) in ocr_output:
+                x_coords = [int(p[0]) for p in bbox]
+                y_coords = [int(p[1]) for p in bbox]
                 simple_bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
-                # --- END OF FIX ---
-                
-                # Crop the detected box and recognize text with TrOCR for higher accuracy
-                cropped_image = image.crop(simple_bbox)
-                pixel_values = processor(images=cropped_image, return_tensors="pt").pixel_values.to(device)
-                generated_ids = model.generate(pixel_values)
-                generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-                
-                text_blocks.append({"text": generated_text, "location": simple_bbox})
-
+                text_blocks.append({"text": text, "location": simple_bbox})
             results[image_name] = text_blocks
-            logger.info(f"Successfully processed {image_name} with Hybrid OCR.")
         except Exception as e:
             logger.error(f"Failed to process image {image_path}: {e}")
             results[image_name] = []
@@ -117,7 +117,7 @@ def sort_text_blocks(ocr_data: Dict) -> Dict:
         sorted_blocks = sorted(image_info["text_blocks"], key=lambda b: (b["location"][1], b["location"][0]))
         sorted_data["images"].append({"image_name": image_info["image_name"], "text_blocks": sorted_blocks})
     return sorted_data
-    
+
 def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str, max_font_size: int = 60):
     box_width = box[2] - box[0]
     box_height = box[3] - box[1]
@@ -127,8 +127,8 @@ def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str,
     font = ImageFont.truetype(font_path, font_size)
     
     while font_size > 5:
-        avg_char_width = font.getlength("a") 
-        wrap_width = max(1, int(box_width / avg_char_width))
+        avg_char_width = font.getlength("a")
+        wrap_width = max(1, int(box_width / avg_char_width)) if avg_char_width > 0 else 1
         wrapped_text = textwrap.wrap(text, width=wrap_width, break_long_words=True)
         
         line_heights = [draw.textbbox((0, 0), line, font=font)[3] - draw.textbbox((0, 0), line, font=font)[1] if line else font_size for line in wrapped_text]
@@ -154,7 +154,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         [InlineKeyboardButton("✂️ json divide", callback_data="main_divide")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    message_text = "Welcome! This bot uses a high-accuracy OCR model. Please choose an option:"
+    message_text = "Welcome! This bot uses easyocr. Please choose an option:"
     if update.message:
         await update.message.reply_text(message_text, reply_markup=reply_markup)
     elif update.callback_query:
@@ -168,18 +168,11 @@ async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     cleanup_user_data(context)
     return await start(update, context)
 
-# --- All Feature Functions are included below ---
-
+# --- 1. Json Maker ---
 async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    keyboard = [
-        [InlineKeyboardButton("🖼️ Image Upload", callback_data="jm_image")],
-        [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jm_zip")],
-        [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    query, keyboard = update.callback_query, [[InlineKeyboardButton("🖼️ Image Upload", callback_data="jm_image")],[InlineKeyboardButton("🗂️ Zip Upload", callback_data="jm_zip")],[InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
     await query.answer()
-    await query.edit_message_text("How would you like to provide source files?", reply_markup=reply_markup)
+    await query.edit_message_text("How would you like to provide source files?", reply_markup=InlineKeyboardMarkup(keyboard))
     return JSON_MAKER_CHOICE
 
 async def json_maker_prompt_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -196,7 +189,6 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         image_paths = context.user_data['image_paths']
     except KeyError:
         await update.message.reply_text("Something went wrong. Please start over.")
-        cleanup_user_data(context)
         return ConversationHandler.END
     file_to_download, file_name = (None, None)
     if update.message.photo:
@@ -209,29 +201,33 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     file_path = os.path.join(temp_dir_path, file_name)
     await file_to_download.download_to_drive(file_path)
     image_paths.append(file_path)
-    keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="jm_process_images")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"Image {len(image_paths)} received. Send another, or press Done.", reply_markup=reply_markup)
+    keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="jm_prompt_language")]]
+    await update.message.reply_text(f"Image {len(image_paths)} received. Send another, or press Done.", reply_markup=InlineKeyboardMarkup(keyboard))
     return WAITING_IMAGES_OCR
 
-async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def prompt_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    context.user_data['next_step'] = "process_images"
+    keyboard = [[InlineKeyboardButton("Japanese", callback_data="lang_ja"), InlineKeyboardButton("Korean", callback_data="lang_ko")],
+                [InlineKeyboardButton("Chinese (Simp)", callback_data="lang_ch_sim"), InlineKeyboardButton("Chinese (Trad)", callback_data="lang_ch_tra")]]
     await query.answer()
-    await query.edit_message_text("Processing images with Hybrid OCR...")
+    await query.edit_message_text("Please select the primary language of the image(s):", reply_markup=InlineKeyboardMarkup(keyboard))
+    return SELECT_LANGUAGE
+
+async def process_images_with_selected_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    lang_code = query.data.split('_', 1)[1]
+    await query.answer()
+    await query.edit_message_text(f"Processing images with {lang_code.upper()} model...")
     image_paths = context.user_data.get('image_paths', [])
-    if not image_paths:
-        await query.edit_message_text("You didn't send any images! Please start over.")
-        cleanup_user_data(context)
-        return await start(update, context)
-    ocr_data = get_ocr_results(image_paths)
+    ocr_data = get_ocr_results(image_paths, lang_code)
     raw_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
     final_json = sort_text_blocks(raw_json)
     if sum(len(img["text_blocks"]) for img in final_json["images"]) == 0:
-        await query.edit_message_text("I couldn't extract any text. Returning to the main menu.")
+        await query.edit_message_text("I couldn't extract any text. Returning to menu.")
         cleanup_user_data(context)
         return await start(update, context)
-    temp_dir_path = context.user_data['temp_dir_obj'].name
-    json_path = os.path.join(temp_dir_path, "extracted_text.json")
+    json_path = os.path.join(context.user_data['temp_dir_obj'].name, "extracted_text.json")
     with open(json_path, 'w', encoding='utf-8') as f: json.dump(final_json, f, ensure_ascii=False, indent=4)
     await context.bot.send_document(chat_id=query.message.chat.id, document=open(json_path, 'rb'))
     cleanup_user_data(context)
@@ -244,9 +240,20 @@ async def json_maker_prompt_zip(update: Update, context: ContextTypes.DEFAULT_TY
     return WAITING_ZIP_OCR
 
 async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Processing zip file...")
+    context.user_data['zip_file'] = await update.message.document.get_file()
+    context.user_data['next_step'] = "process_zip"
+    keyboard = [[InlineKeyboardButton("Japanese", callback_data="lang_ja"), InlineKeyboardButton("Korean", callback_data="lang_ko")],
+                [InlineKeyboardButton("Chinese (Simp)", callback_data="lang_ch_sim"), InlineKeyboardButton("Chinese (Trad)", callback_data="lang_ch_tra")]]
+    await update.message.reply_text("Zip received. Please select the primary language:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return SELECT_LANGUAGE
+
+async def process_zip_with_selected_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    lang_code = query.data.split('_', 1)[1]
+    await query.answer()
+    await query.edit_message_text(f"Processing zip with {lang_code.upper()} model...")
     with tempfile.TemporaryDirectory() as temp_dir:
-        zip_file = await update.message.document.get_file()
+        zip_file = context.user_data['zip_file']
         zip_path = os.path.join(temp_dir, "input.zip")
         await zip_file.download_to_drive(zip_path)
         extract_path = os.path.join(temp_dir, "extracted")
@@ -257,25 +264,22 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
             if os.path.isdir(folder_path):
                 image_paths = [os.path.join(folder_path, f) for f in sorted(os.listdir(folder_path)) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
                 if image_paths:
-                    ocr_data = get_ocr_results(image_paths)
+                    ocr_data = get_ocr_results(image_paths, lang_code)
                     raw_json = {"images": [{"image_name": name, "text_blocks": blocks} for name, blocks in ocr_data.items()]}
                     sorted_json = sort_text_blocks(raw_json)
                     final_json["folders"].append({"folder_name": folder_name, "images": sorted_json["images"]})
         json_path = os.path.join(temp_dir, "extracted_text_from_zip.json")
         with open(json_path, 'w', encoding='utf-8') as f: json.dump(final_json, f, ensure_ascii=False, indent=4)
-        await update.message.reply_document(document=open(json_path, 'rb'))
+        await context.bot.send_document(chat_id=query.message.chat.id, document=open(json_path, 'rb'))
+    cleanup_user_data(context)
     return await start(update, context)
 
+# --- 2. Json To Comic Translate ---
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    keyboard = [
-        [InlineKeyboardButton("🖼️ Image Upload", callback_data="jt_image")],
-        [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jt_zip")],
-        [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard = [[InlineKeyboardButton("🖼️ Image Upload", callback_data="jt_image")], [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jt_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
     await query.answer()
-    await query.edit_message_text("Choose an option for translation:", reply_markup=reply_markup)
+    await query.edit_message_text("Choose an option for translation:", reply_markup=InlineKeyboardMarkup(keyboard))
     return JSON_TRANSLATE_CHOICE
 
 async def json_translate_prompt_json_for_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -297,8 +301,7 @@ async def json_translate_collect_images(update: Update, context: ContextTypes.DE
         temp_dir_path = context.user_data['temp_dir_obj'].name
         received_images = context.user_data['received_images']
     except KeyError:
-        await update.message.reply_text("Something went wrong. Please start over.")
-        cleanup_user_data(context)
+        await update.message.reply_text("Something went wrong.")
         return ConversationHandler.END
     file_to_download, original_filename = (None, None)
     if update.message.photo:
@@ -312,8 +315,7 @@ async def json_translate_collect_images(update: Update, context: ContextTypes.DE
     await file_to_download.download_to_drive(file_path)
     received_images[original_filename] = file_path
     keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="jt_process_images")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"Image '{original_filename}' received. Send another, or press Done.", reply_markup=reply_markup)
+    await update.message.reply_text(f"Image '{original_filename}' received. Send another, or press Done.", reply_markup=InlineKeyboardMarkup(keyboard))
     return WAITING_IMAGES_TRANSLATE
 
 async def json_translate_process_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -325,8 +327,14 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
         await query.edit_message_text("You didn't send any images! Please start over.")
         cleanup_user_data(context)
         return await start(update, context)
-    images_json_data = json_data.get("images", [])
-    if "folders" in json_data and json_data["folders"]: images_json_data.extend(json_data["folders"][0].get("images", []))
+    try: font = ImageFont.truetype(FONT_PATH, 20)
+    except IOError:
+        await context.bot.send_message(chat_id=query.message.chat.id, text=f"⚠️ Error: Font file '{FONT_PATH}' not found.")
+        cleanup_user_data(context)
+        return await start(update, context)
+    images_json_data = []
+    if "images" in json_data: images_json_data = json_data["images"]
+    elif "folders" in json_data and json_data["folders"]: images_json_data = json_data["folders"][0].get("images", [])
     if not images_json_data:
         await query.edit_message_text("Could not find an 'images' list in your JSON file.")
         cleanup_user_data(context)
@@ -358,7 +366,7 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
 async def json_translate_prompt_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Please upload the JSON file that contains the translated text.")
+    await query.edit_message_text("Please upload the JSON file with the translated text.")
     return WAITING_JSON_TRANSLATE_ZIP
 
 async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -370,6 +378,11 @@ async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.
 async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Applying translation...")
     json_data = context.user_data['json_data']
+    try: font = ImageFont.truetype(FONT_PATH, 20)
+    except IOError:
+        await update.message.reply_text(f"⚠️ Error: Font file '{FONT_PATH}' not found.")
+        cleanup_user_data(context)
+        return await start(update, context)
     with tempfile.TemporaryDirectory() as temp_dir:
         zip_file = await update.message.document.get_file()
         input_zip_path = os.path.join(temp_dir, "input.zip")
@@ -398,15 +411,12 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
     cleanup_user_data(context)
     return await start(update, context)
 
+# --- 3. Json Divide ---
 async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    keyboard = [
-        [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jd_zip")],
-        [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard = [[InlineKeyboardButton("🗂️ Zip Upload", callback_data="jd_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
     await query.answer()
-    await query.edit_message_text("This feature takes a master JSON and a zip file, then creates a divided zip with masked images.", reply_markup=reply_markup)
+    await query.edit_message_text("This feature divides a master JSON and masks images.", reply_markup=InlineKeyboardMarkup(keyboard))
     return JSON_DIVIDE_CHOICE
 
 async def json_divide_prompt_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -452,6 +462,7 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
     cleanup_user_data(context)
     return await start(update, context)
 
+# --- Main Application Setup ---
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
     conv_handler = ConversationHandler(
@@ -470,9 +481,13 @@ def main() -> None:
             ],
             WAITING_IMAGES_OCR: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, collect_images),
-                CallbackQueryHandler(process_collected_images, pattern="^jm_process_images$"),
+                CallbackQueryHandler(prompt_language, pattern="^jm_prompt_language$"),
             ],
             WAITING_ZIP_OCR: [MessageHandler(filters.Document.ZIP, json_maker_process_zip)],
+            SELECT_LANGUAGE: [
+                CallbackQueryHandler(process_images_with_selected_language, pattern="^lang_"),
+                CallbackQueryHandler(process_zip_with_selected_language, pattern="^lang_")
+            ],
             JSON_TRANSLATE_CHOICE: [
                 CallbackQueryHandler(json_translate_prompt_json_for_img, pattern="^jt_image$"),
                 CallbackQueryHandler(json_translate_prompt_json_for_zip, pattern="^jt_zip$"),
@@ -497,6 +512,5 @@ def main() -> None:
     application.add_handler(conv_handler)
     application.run_polling()
 
-# This is the crucial part that was missing before
 if __name__ == "__main__":
     main()
