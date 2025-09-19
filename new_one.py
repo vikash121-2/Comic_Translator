@@ -108,6 +108,7 @@ def preprocess_for_ocr(image_path: str) -> np.ndarray:
 # -------------------------------------------------------------------
 
 
+# --- Updated get_ocr_results function ---
 def get_ocr_results(image_paths: List[str], lang_code: str) -> Dict:
     results = {}
     reader = readers.get(lang_code)
@@ -118,23 +119,37 @@ def get_ocr_results(image_paths: List[str], lang_code: str) -> Dict:
     for image_path in image_paths:
         image_name = os.path.basename(image_path)
         try:
-            # USE THE NEW PREPROCESSING FUNCTION
             preprocessed_image = preprocess_for_ocr(image_path)
             if preprocessed_image is None:
                 logger.error(f"Preprocessing returned None for {image_path}. Skipping.")
                 results[image_name] = []
                 continue
 
-            ocr_output = reader.readtext(preprocessed_image, detail=1, paragraph=False)
+            # Key change: We're still using detail=1, but the subsequent processing
+            # will try to infer lines better. EasyOCR's 'paragraph' mode is
+            # not ideal for individual comic bubbles, but raw output needs
+            # smart post-processing.
+            ocr_output = reader.readtext(preprocessed_image, detail=1) # paragraph=False by default for EasyOCR
+            
             text_blocks = []
             for (bbox, text, prob) in ocr_output:
+                # Ensure bounding box coordinates are integers
                 x_coords = [int(p[0]) for p in bbox]
                 y_coords = [int(p[1]) for p in bbox]
                 simple_bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
-                text_blocks.append({"text": text, "location": simple_bbox})
+                
+                # We'll store original height for text fitting
+                original_height = simple_bbox[3] - simple_bbox[1]
+                
+                text_blocks.append({
+                    "text": text,
+                    "location": simple_bbox,
+                    "original_height": original_height # Store for font sizing in translation
+                })
             results[image_name] = text_blocks
         except Exception as e:
             logger.error(f"Failed to process image {image_path}: {e}")
+            logger.error(traceback.format_exc())
             results[image_name] = []
     return results
 
@@ -354,6 +369,7 @@ async def json_translate_collect_images(update: Update, context: ContextTypes.DE
     await update.message.reply_text(f"Image '{original_filename}' received. Send another, or press Done.", reply_markup=reply_markup)
     return WAITING_IMAGES_TRANSLATE
 
+# --- Updated json_translate_process_images function ---
 async def json_translate_process_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -361,21 +377,30 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
 
     json_data = context.user_data.get('json_data', {})
     received_images = context.user_data.get('received_images', {})
+    
     if not received_images:
         await query.edit_message_text("You didn't send any images! Please start over.")
         cleanup_user_data(context)
         return await start(update, context)
-    try: font = ImageFont.truetype(FONT_PATH, 20)
+
+    # Base font size - will be adjusted dynamically
+    base_font_size = 20
+    try:
+        # Load a default font. Dynamic sizing will use this as a base.
+        default_font = ImageFont.truetype(FONT_PATH, base_font_size)
     except IOError:
         await context.bot.send_message(chat_id=query.message.chat.id, text=f"⚠️ Error: Font file '{FONT_PATH}' not found.")
         cleanup_user_data(context)
         return await start(update, context)
 
     images_json_data = []
-    if "images" in json_data: images_json_data = json_data["images"]
-    elif "folders" in json_data and json_data["folders"]: images_json_data = json_data["folders"][0].get("images", [])
+    if "images" in json_data:
+        images_json_data = json_data["images"]
+    elif "folders" in json_data and json_data["folders"]:
+        images_json_data = json_data["folders"][0].get("images", [])
+
     if not images_json_data:
-        await query.edit_message_text("Could not find an 'images' list in your JSON file.")
+        await query.edit_message_text("Could not find an 'images' list in your JSON file. Please check the file format.")
         cleanup_user_data(context)
         return await start(update, context)
     
@@ -384,13 +409,68 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
         image_name = image_info.get("image_name")
         if image_name in received_images:
             image_path = received_images[image_name]
+            
             with Image.open(image_path).convert("RGB") as img:
                 draw = ImageDraw.Draw(img)
-                for block in image_info.get("text_blocks", []):
-                    text, loc = block["text"], block["location"]
-                    draw.rectangle(loc, fill="white")
-                    draw.text((loc[0], loc[1]), text, font=font, fill="black")
                 
+                for block in image_info.get("text_blocks", []):
+                    translated_text = block["text"]
+                    loc = block["location"] # [x1, y1, x2, y2]
+                    
+                    # Calculate width and height of the bounding box
+                    box_width = loc[2] - loc[0]
+                    box_height = loc[3] - loc[1]
+
+                    if box_width <= 0 or box_height <= 0:
+                        logger.warning(f"Invalid bounding box dimensions for block in {image_name}: {loc}")
+                        continue
+
+                    # Draw a white rectangle to cover the original text
+                    draw.rectangle(loc, fill="white")
+
+                    # --- Dynamic Font Sizing and Text Wrapping ---
+                    
+                    # Start with a large font size and decrease until text fits
+                    current_font_size = min(base_font_size * 2, box_height) # Max font size to not exceed box height initially
+                    font = ImageFont.truetype(FONT_PATH, current_font_size)
+                    
+                    # Try to fit the text
+                    lines = []
+                    line_height = 0
+                    
+                    # Simple heuristic for fitting text, can be improved
+                    while current_font_size > 5: # Don't go too small
+                        font = ImageFont.truetype(FONT_PATH, current_font_size)
+                        lines = []
+                        words = translated_text.split(' ')
+                        
+                        current_line = []
+                        for word in words:
+                            test_line = ' '.join(current_line + [word])
+                            line_width, line_height = draw.textbbox((0,0), test_line, font=font)[2:] # get width and height
+                            if line_width <= box_width:
+                                current_line.append(word)
+                            else:
+                                lines.append(' '.join(current_line))
+                                current_line = [word]
+                        if current_line:
+                            lines.append(' '.join(current_line))
+                        
+                        # Check if all lines fit within the box height
+                        if len(lines) * line_height <= box_height:
+                            break # Text fits!
+                        
+                        current_font_size -= 1 # Decrease font size
+                    
+                    # --- Draw the wrapped text ---
+                    y_text = loc[1] # Start drawing from top of the box
+                    for line in lines:
+                        line_width, line_height = draw.textbbox((0,0), line, font=font)[2:]
+                        # Center text horizontally in the box
+                        x_text = loc[0] + (box_width - line_width) / 2
+                        draw.text((x_text, y_text), line, font=font, fill="black")
+                        y_text += line_height # Move to next line
+
                 bio = io.BytesIO()
                 bio.name = f"translated_{image_name}"
                 img.save(bio, 'JPEG')
@@ -399,12 +479,13 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
                 images_processed += 1
 
     if images_processed == 0:
-        await context.bot.send_message(chat_id=query.message.chat.id, text="Warning: No matching image names found.")
+        await context.bot.send_message(chat_id=query.message.chat.id, text="Warning: No matching image names found between your JSON file and the images you uploaded. Please check the 'image_name' fields.")
     else:
         await context.bot.send_message(chat_id=query.message.chat.id, text="Translation complete!")
+        
     cleanup_user_data(context)
     return await start(update, context)
-
+    
 async def json_translate_prompt_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -417,10 +498,13 @@ async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.
     await update.message.reply_text("JSON file received. Now, please upload the original zip file.")
     return WAITING_ZIP_TRANSLATE
 
+# --- Updated json_translate_process_zip function ---
 async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Processing translation...")
+    await update.message.reply_text("Processing translation... This may take a while.")
     json_data = context.user_data['json_data']
-    try: font = ImageFont.truetype(FONT_PATH, 20)
+    
+    base_font_size = 20
+    try: default_font = ImageFont.truetype(FONT_PATH, base_font_size)
     except IOError:
         await update.message.reply_text(f"⚠️ Error: Font file '{FONT_PATH}' not found.")
         cleanup_user_data(context)
@@ -445,14 +529,59 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
                     with Image.open(original_image_path).convert("RGB") as img:
                         draw = ImageDraw.Draw(img)
                         for block in image_data.get("text_blocks", []):
-                            text, loc = block["text"], block["location"]
+                            translated_text = block["text"]
+                            loc = block["location"] # [x1, y1, x2, y2]
+                            
+                            box_width = loc[2] - loc[0]
+                            box_height = loc[3] - loc[1]
+
+                            if box_width <= 0 or box_height <= 0:
+                                logger.warning(f"Invalid bounding box dimensions for block in {image_name}: {loc}")
+                                continue
+
                             draw.rectangle(loc, fill="white")
-                            draw.text((loc[0], loc[1]), text, font=font, fill="black")
+
+                            current_font_size = min(base_font_size * 2, box_height)
+                            font = ImageFont.truetype(FONT_PATH, current_font_size)
+                            
+                            lines = []
+                            line_height = 0
+                            
+                            while current_font_size > 5:
+                                font = ImageFont.truetype(FONT_PATH, current_font_size)
+                                lines = []
+                                words = translated_text.split(' ')
+                                
+                                current_line = []
+                                for word in words:
+                                    test_line = ' '.join(current_line + [word])
+                                    line_width, line_height = draw.textbbox((0,0), test_line, font=font)[2:]
+                                    if line_width <= box_width:
+                                        current_line.append(word)
+                                    else:
+                                        lines.append(' '.join(current_line))
+                                        current_line = [word]
+                                if current_line:
+                                    lines.append(' '.join(current_line))
+                                
+                                if len(lines) * line_height <= box_height:
+                                    break
+                                
+                                current_font_size -= 1
+                            
+                            y_text = loc[1]
+                            for line in lines:
+                                line_width, line_height = draw.textbbox((0,0), line, font=font)[2:]
+                                x_text = loc[0] + (box_width - line_width) / 2
+                                draw.text((x_text, y_text), line, font=font, fill="black")
+                                y_text += line_height
+
                         img.save(os.path.join(output_folder_path, image_name))
         
         output_zip_name = os.path.join(temp_dir, "translated_comic")
         shutil.make_archive(output_zip_name, 'zip', output_path)
         await update.message.reply_document(document=open(f"{output_zip_name}.zip", 'rb'))
+
     cleanup_user_data(context)
     return await start(update, context)
 
