@@ -30,7 +30,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
+from google.colab import userdata
+BOT_TOKEN = userdata.get('BOT_TOKEN')
 FONT_PATH = "DMSerifText-Regular.ttf"  # <-- IMPORTANT: Make sure this font file is in the same directory
 
 # Conversation states
