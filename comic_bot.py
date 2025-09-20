@@ -166,32 +166,47 @@ async def json_maker_prompt_files(update: Update, context: ContextTypes.DEFAULT_
     return WAITING_FILES_OCR
 
 async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    progress_message = await update.message.reply_text("Zip received. Unpacking and processing...")
+    await update.message.reply_text("Files received. Processing...")
     lang_code = context.user_data.get('lang_code', 'en')
     ocr_reader = get_reader([lang_code, 'en'])
     if ocr_reader is None:
-        await progress_message.edit_text("Error: OCR model could not be loaded.")
+        await update.message.reply_text("Error: OCR model could not be loaded.")
         return await back_to_main_menu(update, context)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         input_dir = Path(temp_dir)
-        tg_file = await update.message.document.get_file()
-        file_path = input_dir / tg_file.file_name
-        await tg_file.download_to_drive(file_path)
-        with zipfile.ZipFile(file_path, 'r') as zip_ref:
-            zip_ref.extractall(input_dir)
-        os.remove(file_path)
+        file_to_process = update.message.document or update.message.photo
+        
+        if file_to_process:
+            if isinstance(file_to_process, list):
+                file_to_process = file_to_process[-1]
 
-        all_files = [p for p in input_dir.rglob('*') if p.is_file()]
-        image_paths = [p for p in all_files if filetype.is_image(p)]
+            # --- CORRECTED LOGIC ---
+            # Get the filename from the original object (document or photo) first.
+            # For photos, which don't have a filename, create a unique one using its file_id.
+            file_name = getattr(file_to_process, 'file_name', f"{file_to_process.file_id}.jpg")
+            
+            # Now, get the file object itself to download it
+            tg_file = await file_to_process.get_file()
+            # --- END OF FIX ---
+
+            file_path = input_dir / file_name
+            await tg_file.download_to_drive(file_path)
+
+            if file_path.suffix.lower() == '.zip':
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    zip_ref.extractall(input_dir)
+                os.remove(file_path)
+
+        image_paths = list(input_dir.rglob('*.jpg')) + list(input_dir.rglob('*.jpeg')) + list(input_dir.rglob('*.png'))
         if not image_paths:
-            await progress_message.edit_text("No compatible images found in the zip.")
+            await update.message.reply_text("No images found to process.")
             return await back_to_main_menu(update, context)
             
-        all_text_data, processed_count = [], 0
-        total_images = len(image_paths)
+        all_text_data = []
         for img_path in sorted(image_paths):
             relative_path = img_path.relative_to(input_dir)
+            logger.info(f"Extracting text from: {relative_path}")
             try:
                 img_np = np.array(Image.open(img_path).convert("RGB"))
                 results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
@@ -200,18 +215,16 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
                     all_text_data.append(text_entry)
             except Exception as e:
                 logger.error(f"Error processing {relative_path}: {e}")
-            processed_count += 1
-            if processed_count % 5 == 0: # Update every 5 images
-                await send_progress_update(progress_message, processed_count, total_images, "Extraction")
         
         json_path = input_dir / "extracted_text.json"
-        with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
-        await progress_message.delete()
-        await update.message.reply_document(document=open(json_path, 'rb'), caption=f"Extraction complete. Processed {total_images} images.")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(all_text_data, f, ensure_ascii=False, indent=4)
+
+        await update.message.reply_document(document=open(json_path, 'rb'), caption=f"Extraction complete.")
 
     cleanup_user_data(context)
     return await start(update, context)
-
+    
 # --- FEATURE 2: JSON TO COMIC TRANSLATE ---
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
