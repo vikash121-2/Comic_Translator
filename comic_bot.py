@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
-
 FONT_PATH = "ComicNeue-Bold.ttf"
 
 # --- CONVERSATION STATES ---
@@ -86,10 +85,15 @@ def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str,
     box_width, box_height = box[2] - box[0], box[3] - box[1]
     if not text.strip() or box_width <= 10 or box_height <= 10: return
     font_size = max_font_size
-    font = ImageFont.truetype(font_path, font_size)
     
     while font_size > 5:
-        font = ImageFont.truetype(font_path, font_size)
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except IOError:
+            logger.error(f"Could not load font: {font_path}")
+            draw.text((box[0], box[1]), "[Font Not Found]", fill="red")
+            return
+
         avg_char_width = font.getlength("a")
         wrap_width = max(1, int(box_width / avg_char_width * 1.8)) if avg_char_width > 0 else 1
         wrapped_text = "\n".join(textwrap.wrap(text, width=wrap_width, break_long_words=True))
@@ -142,7 +146,7 @@ async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def json_maker_prompt_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     context.user_data['workflow'] = query.data.split('_')[1]
-    keyboard = [[InlineKeyboardButton("Japanese", callback_data="lang_ja")], [InlineKeyboardButton("Korean", callback_data="lang_ko")], [InlineKeyboardButton("Chinese (Simp)", callback_data="lang_ch_sim"), InlineKeyboardButton("Chinese (Trad)", callback_data="lang_ch_tra")]]
+    keyboard = [[InlineKeyboardButton("Japanese", callback_data="lang_ja"), InlineKeyboardButton("Korean", callback_data="lang_ko")], [InlineKeyboardButton("Chinese (Simp)", callback_data="lang_ch_sim"), InlineKeyboardButton("Chinese (Trad)", callback_data="lang_ch_tra")]]
     await query.answer()
     await query.edit_message_text("Please select the source language:", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_LANGUAGE
@@ -449,13 +453,13 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
             if not folder_abs_path.is_dir(): continue
             folder_json_path = folder_abs_path / "folder_text.json"
             with open(folder_json_path, 'w', encoding='utf-8') as f: json.dump(blocks, f, ensure_ascii=False, indent=4)
-            images_in_folder = {Path(b['filename']).name for b in blocks}
-            for img_name in images_in_folder:
-                img_path = folder_abs_path / img_name
+            images_in_folder = {b['filename'] for b in blocks}
+            for img_rel_path in images_in_folder:
+                img_path = working_dir / Path(img_rel_path)
                 if img_path.exists():
                     img_cv = cv2.imread(str(img_path))
                     mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
-                    boxes_to_mask = [b['bbox'] for b in blocks if Path(b['filename']).name == img_name]
+                    boxes_to_mask = [b['bbox'] for b in blocks if b['filename'] == img_rel_path]
                     for bbox_points in boxes_to_mask:
                         cv2.fillPoly(mask, [np.array(bbox_points, dtype=np.int32)], 255)
                     inpainted_img_cv = cv2.inpaint(img_cv, mask, 3, cv2.INPAINT_TELEA)
@@ -507,6 +511,10 @@ def main() -> None:
             ],
             WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json_for_zip)],
             WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
+            JSON_DIVIDE_CHOICE: [
+                CallbackQueryHandler(json_divide_prompt_json, pattern="^jd_zip$"),
+                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$")
+            ],
             WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.FileExtension("json"), json_divide_get_json)],
             WAITING_ZIP_DIVIDE: [MessageHandler(filters.Document.ZIP, json_divide_process_zip)],
         },
