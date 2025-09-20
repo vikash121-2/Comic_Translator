@@ -199,17 +199,31 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
     if not ocr_reader:
         await update.message.reply_text("Error: OCR model could not be loaded.")
         return await back_to_main_menu(update, context)
+
     with tempfile.TemporaryDirectory() as temp_dir:
         input_dir = Path(temp_dir)
-        tg_file = await update.message.document.get_file()
-        file_path = input_dir / tg_file.file_name
+        
+        # --- THIS IS THE FIX ---
+        # Get the document object from the message first
+        document = update.message.document
+        # Get the filename from the document object
+        file_name = document.file_name
+        # Now, get the file to download
+        tg_file = await document.get_file()
+        # --- END OF FIX ---
+
+        file_path = input_dir / file_name
         await tg_file.download_to_drive(file_path)
-        with zipfile.ZipFile(file_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
+        
+        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            zip_ref.extractall(input_dir)
         os.remove(file_path)
+
         image_paths = [p for p in input_dir.rglob('*') if filetype.is_image(p)]
         if not image_paths:
             await update.message.reply_text("No compatible images found in the zip.")
             return await back_to_main_menu(update, context)
+
         all_text_data = []
         for img_path in sorted(image_paths):
             relative_path = img_path.relative_to(input_dir)
@@ -221,9 +235,13 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
                     all_text_data.append(text_entry)
             except Exception as e:
                 logger.error(f"Error processing {relative_path}: {e}")
+        
         json_path = input_dir / "extracted_text.json"
-        with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(all_text_data, f, ensure_ascii=False, indent=4)
+            
         await update.message.reply_document(document=open(json_path, 'rb'), caption=f"Extraction complete.")
+
     cleanup_user_data(context)
     return await start(update, context)
 
