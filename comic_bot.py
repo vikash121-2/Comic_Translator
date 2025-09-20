@@ -146,7 +146,7 @@ async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def json_maker_prompt_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     context.user_data['workflow'] = query.data.split('_')[1]
-    keyboard = [[InlineKeyboardButton("Japanese", callback_data="lang_ja"), InlineKeyboardButton("Korean", callback_data="lang_ko")], [InlineKeyboardButton("Chinese (Simp)", callback_data="lang_ch_sim"), InlineKeyboardButton("Chinese (Trad)", callback_data="lang_ch_tra")]]
+    keyboard = [[InlineKeyboardButton("Japanese", callback_data="lang_ja")], [InlineKeyboardButton("Korean", callback_data="lang_ko")], [InlineKeyboardButton("Chinese (Simp)", callback_data="lang_ch_sim"), InlineKeyboardButton("Chinese (Trad)", callback_data="lang_ch_tra")]]
     await query.answer()
     await query.edit_message_text("Please select the source language:", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_LANGUAGE
@@ -385,6 +385,8 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
         for img_path in sorted(all_image_paths):
             rel_path_str = str(img_path.relative_to(input_dir)).replace('\\', '/')
             matched_translations = translations_by_file.get(rel_path_str)
+            output_img_path = output_dir / rel_path_str
+            output_img_path.parent.mkdir(parents=True, exist_ok=True)
             if matched_translations:
                 img_cv = cv2.imread(str(img_path))
                 mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
@@ -399,11 +401,9 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
                         x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
                         simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
                         draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
-                output_path = output_dir / rel_path_str
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                img.save(output_path)
+                img.save(output_img_path)
             else:
-                shutil.copy(img_path, output_dir / rel_path_str)
+                shutil.copy(img_path, output_img_path)
             processed_count += 1
             if processed_count % 5 == 0 or processed_count == total_images:
                 await send_progress_update(progress_message, processed_count, total_images, "Translation")
@@ -512,7 +512,7 @@ def main() -> None:
             WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json_for_zip)],
             WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
             JSON_DIVIDE_CHOICE: [
-                CallbackQueryHandler(json_divide_get_json, pattern="^jd_zip$"),
+                CallbackQueryHandler(json_divide_prompt_json, pattern="^jd_zip$"),
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$")
             ],
             WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.FileExtension("json"), json_divide_get_json)],
