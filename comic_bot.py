@@ -340,7 +340,4 @@ def main() -> None:
     application.run_polling()
 
 if __name__ == "__main__":
-    # Note: This is a partial script focusing on the requested fix.
-    # The full bodies of unchanged functions have been omitted for clarity.
-    # You must merge this with your last complete script.
-    pass
+    main()
