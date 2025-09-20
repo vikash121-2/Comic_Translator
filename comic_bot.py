@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
+
 FONT_PATH = "ComicNeue-Bold.ttf"
 
 # --- CONVERSATION STATES ---
@@ -198,8 +199,10 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
         return await back_to_main_menu(update, context)
     with tempfile.TemporaryDirectory() as temp_dir:
         input_dir = Path(temp_dir)
-        tg_file = await update.message.document.get_file()
-        file_path = input_dir / tg_file.file_name
+        document = update.message.document
+        file_name = document.file_name
+        tg_file = await document.get_file()
+        file_path = input_dir / file_name
         await tg_file.download_to_drive(file_path)
         with zipfile.ZipFile(file_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
         os.remove(file_path)
@@ -370,6 +373,12 @@ async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("This feature requires a master JSON and a zip file.\nPlease upload the master JSON file first.")
+    return WAITING_JSON_DIVIDE
+
+async def json_divide_prompt_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Please upload the master JSON file.")
     return WAITING_JSON_DIVIDE
 
 async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
