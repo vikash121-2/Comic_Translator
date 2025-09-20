@@ -9,6 +9,7 @@ from typing import List, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 from pathlib import Path
 import numpy as np
+import torch # <--- FIX 1: ADDED THIS IMPORT
 
 from telegram import (
     Update,
@@ -29,6 +30,7 @@ from telegram.error import BadRequest
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
 
@@ -53,7 +55,6 @@ def get_reader(langs):
         try:
             import easyocr
             logger.info(f"Initializing EasyOCR for languages: {langs}...")
-            # Assuming GPU is available if torch detects it. Change to gpu=False if you have issues.
             reader = easyocr.Reader(langs, gpu=torch.cuda.is_available())
             current_reader_langs = sorted_langs
             logger.info("EasyOCR Initialized.")
@@ -128,15 +129,15 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
     ocr_reader = get_reader([lang_code, 'en'])
     if ocr_reader is None:
         await update.message.reply_text("Error: OCR model could not be loaded. Please check the logs.")
-        return await back_to_main_menu(update.callback_query, context)
+        # --- FIX 2: CORRECTED THIS LINE ---
+        return await back_to_main_menu(update, context)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         input_dir = Path(temp_dir)
         
-        # Download the file(s)
         file_to_process = update.message.document or update.message.photo
         if file_to_process:
-            if isinstance(file_to_process, list): # Handle photo which is a list of sizes
+            if isinstance(file_to_process, list):
                 file_to_process = file_to_process[-1]
 
             tg_file = await file_to_process.get_file()
@@ -149,11 +150,10 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
                     zip_ref.extractall(input_dir)
                 os.remove(file_path)
 
-        # Find all image files
         image_paths = list(input_dir.rglob('*.jpg')) + list(input_dir.rglob('*.jpeg')) + list(input_dir.rglob('*.png'))
         if not image_paths:
             await update.message.reply_text("No images found to process.")
-            return await back_to_main_menu(update.callback_query, context)
+            return await back_to_main_menu(update, context)
             
         all_text_data = []
         for img_path in sorted(image_paths):
@@ -190,28 +190,23 @@ async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     return WAITING_FILES_TRANSLATE
 
 async def apply_translations_to_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Applies translations from a JSON file back onto images."""
     if not update.message.media_group_id:
         await update.message.reply_text("Please send the files together. Select the images/zip and the JSON, then send.")
         return WAITING_FILES_TRANSLATE
 
     context.user_data.setdefault('files_to_process', {})[update.message.media_group_id] = context.user_data.get(update.message.media_group_id, [])
     
-    # Store files from the group
     file_to_process = update.message.document or (update.message.photo[-1] if update.message.photo else None)
     if file_to_process:
         context.user_data['files_to_process'][update.message.media_group_id].append(file_to_process)
 
-    # Check if a job is already scheduled for this group
     job_name = f"process_translation_{update.message.media_group_id}"
     if not context.job_queue.get_jobs_by_name(job_name):
         context.job_queue.run_once(process_translation_job, 2, data={'media_group_id': update.message.media_group_id, 'chat_id': update.effective_chat.id}, name=job_name)
 
     return WAITING_FILES_TRANSLATE
 
-
 async def process_translation_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job to process the collected files for translation."""
     job_data = context.job.data
     media_group_id = job_data['media_group_id']
     chat_id = job_data['chat_id']
@@ -223,8 +218,7 @@ async def process_translation_job(context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(chat_id, "Files received. Applying translations...")
 
-    json_file = None
-    image_files = []
+    json_file, image_files = None, []
     for file in files:
         if hasattr(file, 'file_name') and file.file_name.lower().endswith('.json'):
             json_file = file
@@ -241,7 +235,6 @@ async def process_translation_job(context: ContextTypes.DEFAULT_TYPE):
         input_dir.mkdir()
         output_dir.mkdir()
         
-        # Download and process JSON
         tg_json_file = await json_file.get_file()
         await tg_json_file.download_to_drive(input_dir / json_file.file_name)
         with open(input_dir / json_file.file_name, 'r', encoding='utf-8') as f:
@@ -253,7 +246,6 @@ async def process_translation_job(context: ContextTypes.DEFAULT_TYPE):
             if fname not in translations_by_file: translations_by_file[fname] = []
             translations_by_file[fname].append(entry)
 
-        # Download and process images/zip
         for file in image_files:
             tg_img_file = await file.get_file()
             file_name = file.file_name or f"{tg_img_file.file_id}.jpg"
@@ -265,8 +257,7 @@ async def process_translation_job(context: ContextTypes.DEFAULT_TYPE):
                     zip_ref.extractall(input_dir)
                 os.remove(file_path)
         
-        # Apply translations
-        font = ImageFont.truetype(FONT_PATH, 40) # Start with a larger base font
+        font = ImageFont.truetype(FONT_PATH, 40)
         for rel_path_str, translations in translations_by_file.items():
             img_path = input_dir / Path(rel_path_str)
             if not img_path.exists():
@@ -279,14 +270,9 @@ async def process_translation_job(context: ContextTypes.DEFAULT_TYPE):
             for entry in translations:
                 bbox = entry['bbox']
                 translated_text = entry.get('translated_text', '').strip()
-                top_left = tuple(bbox[0])
-                bottom_right = tuple(bbox[2])
-                
-                # Erase original text
+                top_left, bottom_right = tuple(bbox[0]), tuple(bbox[2])
                 draw.rectangle([top_left, bottom_right], fill="white", outline="black", width=1)
-                
                 if translated_text:
-                    # Use a modified version of the dynamic drawing function
                     draw_text_in_box(draw, [top_left[0], top_left[1], bottom_right[0], bottom_right[1]], translated_text, FONT_PATH)
 
             output_path = output_dir / Path(rel_path_str)
@@ -297,10 +283,30 @@ async def process_translation_job(context: ContextTypes.DEFAULT_TYPE):
         shutil.make_archive(zip_path_str, 'zip', output_dir)
         await context.bot.send_document(chat_id, document=open(f"{zip_path_str}.zip", 'rb'), caption="Processing complete!")
 
-    # Cleanup
     if media_group_id in context.user_data.get('files_to_process', {}):
         del context.user_data['files_to_process'][media_group_id]
 
+def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str, max_font_size: int = 60):
+    box_width, box_height = box[2] - box[0], box[3] - box[1]
+    if box_width <= 0 or box_height <= 0: return
+    font_size = max_font_size
+    font = ImageFont.truetype(font_path, font_size)
+    while font_size > 5:
+        avg_char_width = font.getlength("a")
+        wrap_width = max(1, int(box_width / avg_char_width)) if avg_char_width > 0 else 1
+        wrapped_text = textwrap.wrap(text, width=wrap_width, break_long_words=True)
+        line_heights = [draw.textbbox((0, 0), line, font=font)[3] - draw.textbbox((0, 0), line, font=font)[1] if line else font_size for line in wrapped_text]
+        total_text_height = sum(line_heights)
+        if total_text_height <= box_height and all(font.getlength(line) <= box_width for line in wrapped_text):
+            break
+        font_size -= 2
+        font = ImageFont.truetype(font_path, font_size)
+    y_start = box[1] + (box_height - total_text_height) / 2
+    for i, line in enumerate(wrapped_text):
+        line_width = font.getlength(line)
+        x_start = box[0] + (box_width - line_width) / 2
+        draw.text((x_start, y_start), line, font=font, fill="black")
+        y_start += line_heights[i]
 
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
@@ -318,6 +324,7 @@ def main() -> None:
             ],
             WAITING_FILES_OCR: [MessageHandler(filters.PHOTO | filters.Document.ALL, extract_text_from_files)],
             JSON_TRANSLATE_CHOICE: [
+                CallbackQueryHandler(json_translate_menu, pattern="^main_translate$"), # Re-entry for menu
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
             ],
             WAITING_FILES_TRANSLATE: [MessageHandler(filters.ALL, apply_translations_to_images)],
