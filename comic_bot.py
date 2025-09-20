@@ -6,7 +6,7 @@ import shutil
 import json
 import textwrap
 import torch
-import tempfile # <--- THIS LINE WAS ADDED
+import tempfile
 from typing import List, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 from pathlib import Path
@@ -32,9 +32,11 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# In Colab, you would use:
+# from google.colab import userdata
+# BOT_TOKEN = userdata.get('BOT_TOKEN')
 
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
-
 FONT_PATH = "ComicNeue-Bold.ttf"
 
 # Conversation states
@@ -66,9 +68,9 @@ def get_reader(langs):
 
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
     """Cleans up temporary data at the end of a conversation."""
-    for key in ['temp_dir_obj', 'json_data', 'files_to_process']:
+    for key in ['temp_dir_obj', 'json_data', 'files_to_process', 'lang_code']:
         if key in context.user_data:
-            if hasattr(context.user_data[key], 'cleanup'):
+            if hasattr(context.user_data.get(key), 'cleanup'):
                 context.user_data[key].cleanup()
             del context.user_data[key]
 
@@ -126,7 +128,7 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
     """Processes uploaded files (images or zip), extracts text, and returns a JSON."""
     await update.message.reply_text("Files received. Processing...")
     
-    lang_code = context.user_data.get('lang_code', 'en') # Default to english if not set
+    lang_code = context.user_data.get('lang_code', 'en')
     ocr_reader = get_reader([lang_code, 'en'])
     if ocr_reader is None:
         await update.message.reply_text("Error: OCR model could not be loaded. Please check the logs.")
@@ -141,7 +143,7 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
                 file_to_process = file_to_process[-1]
 
             tg_file = await file_to_process.get_file()
-            file_name = file_to_process.file_name or f"{tg_file.file_id}.jpg"
+            file_name = getattr(file_to_process, 'file_name', f"{tg_file.file_id}.jpg")
             file_path = input_dir / file_name
             await tg_file.download_to_drive(file_path)
 
@@ -159,18 +161,21 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
         for img_path in sorted(image_paths):
             relative_path = img_path.relative_to(input_dir)
             logger.info(f"Extracting text from: {relative_path}")
-            img_np = np.array(Image.open(img_path).convert("RGB"))
-            results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
+            try:
+                img_np = np.array(Image.open(img_path).convert("RGB"))
+                results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
 
-            for i, (bbox, text, prob) in enumerate(results):
-                text_entry = {
-                    "filename": str(relative_path).replace('\\', '/'),
-                    "block_id": i,
-                    "bbox": [[int(p[0]), int(p[1])] for p in bbox],
-                    "original_text": text,
-                    "translated_text": ""
-                }
-                all_text_data.append(text_entry)
+                for i, (bbox, text, prob) in enumerate(results):
+                    text_entry = {
+                        "filename": str(relative_path).replace('\\', '/'),
+                        "block_id": i,
+                        "bbox": [[int(p[0]), int(p[1])] for p in bbox],
+                        "original_text": text,
+                        "translated_text": ""
+                    }
+                    all_text_data.append(text_entry)
+            except Exception as e:
+                logger.error(f"Error processing {relative_path}: {e}")
 
         json_path = input_dir / "extracted_text.json"
         with open(json_path, 'w', encoding='utf-8') as f:
@@ -208,4 +213,26 @@ async def apply_translations_to_images(update: Update, context: ContextTypes.DEF
 
 async def process_translation_job(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data
-    media_group_id = job_
+    media_group_id = job_data['media_group_id']
+    chat_id = job_data['chat_id']
+    
+    files = context.user_data.get('files_to_process', {}).get(media_group_id, [])
+    if not files:
+        await context.bot.send_message(chat_id, "Something went wrong collecting files.")
+        return
+
+    await context.bot.send_message(chat_id, "Files received. Applying translations...")
+
+    json_file, image_files = None, []
+    for file in files:
+        if hasattr(file, 'file_name') and file.file_name and file.file_name.lower().endswith('.json'):
+            json_file = file
+        else:
+            image_files.append(file)
+    
+    if not json_file or not image_files:
+        await context.bot.send_message(chat_id, "Error: You must provide at least one image/zip and one JSON file.")
+        return
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_dir, output_dir = Path(temp_
