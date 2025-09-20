@@ -69,40 +69,27 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
         context.user_data['temp_dir_obj'].cleanup()
     context.user_data.clear()
 
-def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str, max_font_size: int = 80):
-    """
-    REWRITTEN: Draws wrapped, centered, and auto-sized text using modern, reliable methods.
-    """
+def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str, max_font_size: int = 60):
     box_width, box_height = box[2] - box[0], box[3] - box[1]
-    if not text.strip() or box_width <= 10 or box_height <= 10:
-        return
-
+    if not text or box_width <= 0 or box_height <= 0: return
     font_size = max_font_size
     font = ImageFont.truetype(font_path, font_size)
-    
     while font_size > 5:
-        font = ImageFont.truetype(font_path, font_size)
-        
-        # Use textwrap for basic wrapping estimation
         avg_char_width = font.getlength("a")
-        wrap_width = max(1, int(box_width / avg_char_width * 1.5))
-        wrapped_text = "\n".join(textwrap.wrap(text, width=wrap_width, break_long_words=True))
-
-        # Use multiline_textbbox for accurate size calculation
-        text_bbox = draw.multiline_textbbox((0, 0), wrapped_text, font=font, spacing=4)
-        text_width = text_bbox[2] - text_bbox[0]
-        text_height = text_bbox[3] - text_bbox[1]
-
-        if text_height <= box_height and text_width <= box_width:
-            break  # This font size works
-        
-        font_size -= 2 # Decrease font size and try again
-
-    # Draw the final centered text
-    x = box[0] + (box_width - text_width) / 2
-    y = box[1] + (box_height - text_height) / 2
-    draw.multiline_text((x, y), wrapped_text, font=font, fill="black", align="center", spacing=4)
-
+        wrap_width = max(1, int(box_width / avg_char_width * 1.8)) if avg_char_width > 0 else 1
+        wrapped_text = textwrap.wrap(text, width=wrap_width, break_long_words=True)
+        line_heights = [draw.textbbox((0, 0), line, font=font)[3] - draw.textbbox((0, 0), line, font=font)[1] if line else font_size for line in wrapped_text]
+        total_text_height = sum(line_heights)
+        if total_text_height <= box_height and all(font.getlength(line) <= box_width for line in wrapped_text):
+            break
+        font_size -= 2
+        font = ImageFont.truetype(font_path, font_size)
+    y_start = box[1] + (box_height - total_text_height) / 2
+    for i, line in enumerate(wrapped_text):
+        line_width = font.getlength(line)
+        x_start = box[0] + (box_width - line_width) / 2
+        draw.text((x_start, y_start), line, font=font, fill="black", anchor="lt")
+        y_start += line_heights[i]
 
 # --- MAIN MENU & NAVIGATION ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -216,7 +203,7 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
         await tg_file.download_to_drive(file_path)
         with zipfile.ZipFile(file_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
         os.remove(file_path)
-        image_paths = [p for p in input_dir.rglob('*') if filetype.is_image(p)]
+        image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
         if not image_paths:
             await update.message.reply_text("No compatible images found in the zip.")
             return await back_to_main_menu(update, context)
@@ -381,15 +368,8 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
 # --- 3. Json Divide Feature ---
 async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    keyboard = [[InlineKeyboardButton("🗂️ Zip Upload", callback_data="jd_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
     await query.answer()
-    await query.edit_message_text("This feature requires a master JSON and a zip file.\nPlease upload the master JSON file first.", reply_markup=InlineKeyboardMarkup(keyboard))
-    return JSON_DIVIDE_CHOICE
-
-async def json_divide_prompt_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Please upload the master JSON file.")
+    await query.edit_message_text("This feature requires a master JSON and a zip file.\nPlease upload the master JSON file first.")
     return WAITING_JSON_DIVIDE
 
 async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
