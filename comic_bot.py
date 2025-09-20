@@ -70,6 +70,23 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
         context.user_data['temp_dir_obj'].cleanup()
     context.user_data.clear()
 
+# --- HELPER FUNCTIONS ---
+
+# ... (the existing cleanup_user_data and draw_text_in_box functions) ...
+
+
+async def send_progress_update(message: Update.message, current: int, total: int, operation: str):
+    """Asynchronously edits a message to show progress."""
+    text = f"{operation} in progress... {current}/{total}"
+    try:
+        # We check if the text is different to avoid sending an empty update
+        if message.text != text:
+            await message.edit_text(text)
+    except BadRequest as e:
+        # Log errors if the message couldn't be edited for other reasons
+        if "Message is not modified" not in str(e):
+            logger.warning(f"Could not edit progress message: {e}")
+
 def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str, max_font_size: int = 60):
     box_width, box_height = box[2] - box[0], box[3] - box[1]
     if not text.strip() or box_width <= 10 or box_height <= 10: return
