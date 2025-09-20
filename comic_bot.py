@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFile
 from pathlib import Path
 import numpy as np
 import filetype
+import cv2  # <--- ADD THIS LINE
 
 from telegram import (
     Update,
