@@ -50,15 +50,12 @@ FONT_PATH = "ComicNeue-Bold.ttf"
 
 # --- OCR ENGINE SETUP ---
 readers = {}
-
 def get_reader(lang_code):
-    """Initializes a specific EasyOCR reader if it doesn't exist."""
     global readers
     if lang_code not in readers:
         try:
             import easyocr
             logger.info(f"Initializing EasyOCR for language: {lang_code}...")
-            # Each reader is initialized with its specific language + English
             readers[lang_code] = easyocr.Reader([lang_code, 'en'], gpu=torch.cuda.is_available())
             logger.info(f"EasyOCR for {lang_code} Initialized.")
         except Exception as e:
@@ -76,26 +73,20 @@ def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str,
     box_width, box_height = box[2] - box[0], box[3] - box[1]
     if not text or box_width <= 0 or box_height <= 0: return
     font_size = max_font_size
-    try:
-        font = ImageFont.truetype(font_path, font_size)
+    try: font = ImageFont.truetype(font_path, font_size)
     except IOError:
         logger.error(f"Could not load font: {font_path}")
-        draw.text((box[0], box[1]), "[Font Not Found]", fill="red")
         return
-
     while font_size > 5:
         avg_char_width = font.getlength("a")
         wrap_width = max(1, int(box_width / avg_char_width * 1.8)) if avg_char_width > 0 else 1
         wrapped_text = textwrap.wrap(text, width=wrap_width, break_long_words=True)
-        
         line_heights = [draw.textbbox((0, 0), line, font=font)[3] - draw.textbbox((0, 0), line, font=font)[1] if line else font_size for line in wrapped_text]
         total_text_height = sum(line_heights)
-
         if total_text_height <= box_height and all(font.getlength(line) <= box_width for line in wrapped_text):
             break
         font_size -= 2
         font = ImageFont.truetype(font_path, font_size)
-    
     y_start = box[1] + (box_height - total_text_height) / 2
     for i, line in enumerate(wrapped_text):
         line_width = font.getlength(line)
@@ -127,11 +118,7 @@ async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # --- 1. Json Maker (Text Extraction) ---
 async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    keyboard = [
-        [InlineKeyboardButton("🖼️ Image(s) Upload", callback_data="jm_image")],
-        [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jm_zip")],
-        [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
-    ]
+    keyboard = [[InlineKeyboardButton("🖼️ Image(s) Upload", callback_data="jm_image")],[InlineKeyboardButton("🗂️ Zip Upload", callback_data="jm_zip")],[InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
     await query.answer()
     await query.edit_message_text("How would you like to provide source files?", reply_markup=InlineKeyboardMarkup(keyboard))
     return JSON_MAKER_CHOICE
@@ -139,10 +126,7 @@ async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def json_maker_prompt_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     context.user_data['workflow'] = query.data.split('_')[1]
-    keyboard = [
-        [InlineKeyboardButton("Japanese", callback_data="lang_ja"), InlineKeyboardButton("Korean", callback_data="lang_ko")],
-        [InlineKeyboardButton("Chinese (Simp)", callback_data="lang_ch_sim"), InlineKeyboardButton("Chinese (Trad)", callback_data="lang_ch_tra")],
-    ]
+    keyboard = [[InlineKeyboardButton("Japanese", callback_data="lang_ja"), InlineKeyboardButton("Korean", callback_data="lang_ko")], [InlineKeyboardButton("Chinese (Simp)", callback_data="lang_ch_sim"), InlineKeyboardButton("Chinese (Trad)", callback_data="lang_ch_tra")]]
     await query.answer()
     await query.edit_message_text("Please select the source language:", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_LANGUAGE
@@ -387,8 +371,15 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
 # --- 3. Json Divide Feature ---
 async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    keyboard = [[InlineKeyboardButton("🗂️ Zip Upload", callback_data="jd_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
     await query.answer()
-    await query.edit_message_text("This feature requires a master JSON and a zip file.\nPlease upload the master JSON file first.")
+    await query.edit_message_text("This feature requires a master JSON and a zip file.\nPlease upload the master JSON file first.", reply_markup=InlineKeyboardMarkup(keyboard))
+    return JSON_DIVIDE_CHOICE
+
+async def json_divide_prompt_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Please upload the master JSON file.")
     return WAITING_JSON_DIVIDE
 
 async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
