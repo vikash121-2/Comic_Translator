@@ -7,6 +7,7 @@ import json
 import textwrap
 import torch
 import tempfile
+import asyncio
 from typing import List, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 from pathlib import Path
@@ -69,13 +70,23 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
         context.user_data['temp_dir_obj'].cleanup()
     context.user_data.clear()
 
+async def send_progress_update(message, processed_count, total_count, feature_name):
+    """Sends a progress update message, avoiding rate limits."""
+    try:
+        progress_text = f"[{feature_name}] Progress: {processed_count} / {total_count} images processed."
+        await message.edit_text(progress_text)
+        await asyncio.sleep(0.1) # Be nice to Telegram's API
+    except Exception as e:
+        logger.warning(f"Could not update progress message: {e}")
+
 def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str, max_font_size: int = 60):
     box_width, box_height = box[2] - box[0], box[3] - box[1]
-    if not text or box_width <= 0 or box_height <= 0: return
+    if not text or box_width <= 10 or box_height <= 10: return
     font_size = max_font_size
     try: font = ImageFont.truetype(font_path, font_size)
     except IOError:
         logger.error(f"Could not load font: {font_path}")
+        draw.text((box[0], box[1]), "[Font Not Found]", fill="red")
         return
     while font_size > 5:
         avg_char_width = font.getlength("a")
@@ -91,6 +102,10 @@ def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str,
     for i, line in enumerate(wrapped_text):
         line_width = font.getlength(line)
         x_start = box[0] + (box_width - line_width) / 2
+        draw.text((x_start-1, y_start-1), line, font=font, fill="white", anchor="lt")
+        draw.text((x_start+1, y_start-1), line, font=font, fill="white", anchor="lt")
+        draw.text((x_start-1, y_start+1), line, font=font, fill="white", anchor="lt")
+        draw.text((x_start+1, y_start+1), line, font=font, fill="white", anchor="lt")
         draw.text((x_start, y_start), line, font=font, fill="black", anchor="lt")
         y_start += line_heights[i]
 
@@ -193,38 +208,24 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     return await start(update, context)
 
 async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Zip file received. Processing...")
+    progress_message = await update.message.reply_text("Zip received. Unpacking and processing...")
     lang_code = context.user_data.get('lang_code', 'en')
     ocr_reader = get_reader(lang_code)
     if not ocr_reader:
-        await update.message.reply_text("Error: OCR model could not be loaded.")
+        await progress_message.edit_text("Error: OCR model could not be loaded.")
         return await back_to_main_menu(update, context)
-
     with tempfile.TemporaryDirectory() as temp_dir:
         input_dir = Path(temp_dir)
-        
-        # --- THIS IS THE FIX ---
-        # Get the document object from the message first
-        document = update.message.document
-        # Get the filename from the document object
-        file_name = document.file_name
-        # Now, get the file to download
-        tg_file = await document.get_file()
-        # --- END OF FIX ---
-
-        file_path = input_dir / file_name
+        tg_file = await update.message.document.get_file()
+        file_path = input_dir / tg_file.file_name
         await tg_file.download_to_drive(file_path)
-        
-        with zipfile.ZipFile(file_path, 'r') as zip_ref:
-            zip_ref.extractall(input_dir)
+        with zipfile.ZipFile(file_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
         os.remove(file_path)
-
-        image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
+        image_paths = [p for p in input_dir.rglob('*') if filetype.is_image(p)]
         if not image_paths:
-            await update.message.reply_text("No compatible images found in the zip.")
+            await progress_message.edit_text("No compatible images found in the zip.")
             return await back_to_main_menu(update, context)
-
-        all_text_data = []
+        all_text_data, processed_count, total_images = [], 0, len(image_paths)
         for img_path in sorted(image_paths):
             relative_path = img_path.relative_to(input_dir)
             try:
@@ -235,16 +236,16 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
                     all_text_data.append(text_entry)
             except Exception as e:
                 logger.error(f"Error processing {relative_path}: {e}")
-        
+            processed_count += 1
+            if processed_count % 5 == 0:
+                await send_progress_update(progress_message, processed_count, total_images, "Extraction")
         json_path = input_dir / "extracted_text.json"
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(all_text_data, f, ensure_ascii=False, indent=4)
-            
+        with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
+        await progress_message.delete()
         await update.message.reply_document(document=open(json_path, 'rb'), caption=f"Extraction complete.")
-
     cleanup_user_data(context)
     return await start(update, context)
-    
+
 # --- 2. Json To Comic Translate ---
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -310,13 +311,17 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
     for uploaded_filename, image_path in received_images.items():
         matched_translations = translations_by_file.get(uploaded_filename) or translations_by_file.get(Path(uploaded_filename).name)
         if matched_translations:
-            img = Image.open(image_path).convert("RGB")
+            img_cv = cv2.imread(image_path)
+            mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
+            for entry in matched_translations:
+                cv2.fillPoly(mask, [np.array(entry['bbox'], dtype=np.int32)], 255)
+            inpainted_img_cv = cv2.inpaint(img_cv, mask, 3, cv2.INPAINT_TELEA)
+            img = Image.fromarray(cv2.cvtColor(inpainted_img_cv, cv2.COLOR_BGR2RGB))
             draw = ImageDraw.Draw(img)
             for entry in matched_translations:
                 bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
                 x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
                 simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
-                draw.rectangle(simple_box, fill="white", outline="black", width=1)
                 if translated_text:
                     draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
             bio = io.BytesIO()
@@ -345,13 +350,13 @@ async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.
     return WAITING_ZIP_TRANSLATE
 
 async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Zip file received. Applying translations...")
+    progress_message = await update.message.reply_text("Zip file received. Applying translations...")
     json_data = context.user_data.get('json_data')
     if not json_data:
-        await update.message.reply_text("Error: JSON data was lost.")
+        await progress_message.edit_text("Error: JSON data was lost.")
         return await back_to_main_menu(update, context)
     if not os.path.exists(FONT_PATH):
-        await update.message.reply_text(f"CRITICAL ERROR: Font file '{FONT_PATH}' not found!")
+        await progress_message.edit_text(f"CRITICAL ERROR: Font file '{FONT_PATH}' not found!")
         return await back_to_main_menu(update, context)
     with tempfile.TemporaryDirectory() as temp_dir:
         input_dir = Path(temp_dir) / "input"; output_dir = Path(temp_dir) / "output"
@@ -365,23 +370,33 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
             fname = entry['filename']
             if fname not in translations_by_file: translations_by_file[fname] = []
             translations_by_file[fname].append(entry)
+        all_image_paths = [p for p in input_dir.rglob('*') if filetype.is_image(p)]
+        total_images, processed_count = len(all_image_paths), 0
         for rel_path_str, translations in translations_by_file.items():
             img_path = input_dir / Path(rel_path_str)
             if not img_path.exists(): continue
-            img = Image.open(img_path).convert("RGB")
+            img_cv = cv2.imread(str(img_path))
+            mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
+            for entry in translations:
+                cv2.fillPoly(mask, [np.array(entry['bbox'], dtype=np.int32)], 255)
+            inpainted_img_cv = cv2.inpaint(img_cv, mask, 3, cv2.INPAINT_TELEA)
+            img = Image.fromarray(cv2.cvtColor(inpainted_img_cv, cv2.COLOR_BGR2RGB))
             draw = ImageDraw.Draw(img)
             for entry in translations:
                 bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
-                x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
-                simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
-                draw.rectangle(simple_box, fill="white", outline="black", width=1)
                 if translated_text:
+                    x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
+                    simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
                     draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
             output_path = output_dir / Path(rel_path_str)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             img.save(output_path)
+            processed_count +=1
+            if processed_count % 5 == 0:
+                await send_progress_update(progress_message, processed_count, total_images, "Translation")
         zip_path_str = os.path.join(temp_dir, "final_translated_comics")
         shutil.make_archive(zip_path_str, 'zip', output_dir)
+        await progress_message.delete()
         await update.message.reply_document(document=open(f"{zip_path_str}.zip", 'rb'), caption="Processing complete!")
     cleanup_user_data(context)
     return await start(update, context)
@@ -407,10 +422,10 @@ async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAITING_ZIP_DIVIDE
 
 async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Zip file received. Dividing JSON and masking images...")
+    progress_message = await update.message.reply_text("Zip file received. Dividing JSON and masking images...")
     json_data = context.user_data.get('json_data')
     if not json_data:
-        await update.message.reply_text("Error: JSON data was lost.")
+        await progress_message.edit_text("Error: JSON data was lost.")
         return await back_to_main_menu(update, context)
     with tempfile.TemporaryDirectory() as temp_dir:
         working_dir = Path(temp_dir) / "work"
@@ -419,31 +434,36 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
         zip_path = working_dir / "images.zip"
         await zip_tg_file.download_to_drive(zip_path)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(working_dir)
-        blocks_by_folder = {}
+        blocks_by_folder, all_images_to_process = {}, set()
         for entry in json_data:
             p = Path(entry['filename'])
             folder_name = str(p.parent)
             if folder_name not in blocks_by_folder: blocks_by_folder[folder_name] = []
             blocks_by_folder[folder_name].append(entry)
+            all_images_to_process.add(entry['filename'])
+        total_images, processed_count = len(all_images_to_process), 0
         for folder_rel_path, blocks in blocks_by_folder.items():
             folder_abs_path = working_dir / Path(folder_rel_path)
             if not folder_abs_path.is_dir(): continue
             folder_json_path = folder_abs_path / "folder_text.json"
             with open(folder_json_path, 'w', encoding='utf-8') as f: json.dump(blocks, f, ensure_ascii=False, indent=4)
-            images_in_folder = {Path(b['filename']).name for b in blocks}
-            for img_name in images_in_folder:
-                img_path = folder_abs_path / img_name
+            images_in_folder = {b['filename'] for b in blocks}
+            for img_rel_path in images_in_folder:
+                img_path = working_dir / Path(img_rel_path)
                 if img_path.exists():
-                    img = Image.open(img_path).convert("RGB")
-                    draw = ImageDraw.Draw(img)
-                    boxes_to_mask = [b['bbox'] for b in blocks if Path(b['filename']).name == img_name]
+                    img_cv = cv2.imread(str(img_path))
+                    mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
+                    boxes_to_mask = [b['bbox'] for b in blocks if b['filename'] == img_rel_path]
                     for bbox_points in boxes_to_mask:
-                        x_coords = [p[0] for p in bbox_points]; y_coords = [p[1] for p in bbox_points]
-                        simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
-                        draw.rectangle(simple_box, fill="black")
-                    img.save(img_path)
+                        cv2.fillPoly(mask, [np.array(bbox_points, dtype=np.int32)], 255)
+                    inpainted_img_cv = cv2.inpaint(img_cv, mask, 3, cv2.INPAINT_TELEA)
+                    cv2.imwrite(str(img_path), inpainted_img_cv)
+                    processed_count +=1
+                    if processed_count % 5 == 0:
+                        await send_progress_update(progress_message, processed_count, total_images, "Masking")
         zip_path_str = os.path.join(temp_dir, "final_divided_comics")
         shutil.make_archive(zip_path_str, 'zip', working_dir)
+        await progress_message.delete()
         await update.message.reply_document(document=open(f"{zip_path_str}.zip", 'rb'), caption="Dividing complete!")
     cleanup_user_data(context)
     return await start(update, context)
@@ -465,9 +485,7 @@ def main() -> None:
                 CallbackQueryHandler(json_maker_prompt_language, pattern="^jm_zip$"),
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
             ],
-            CHOOSE_LANGUAGE: [
-                CallbackQueryHandler(json_maker_prompt_files, pattern="^lang_"),
-            ],
+            CHOOSE_LANGUAGE: [CallbackQueryHandler(json_maker_prompt_files, pattern="^lang_")],
             WAITING_IMAGES_OCR: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, collect_images),
                 CallbackQueryHandler(process_collected_images, pattern="^process_images$"),
