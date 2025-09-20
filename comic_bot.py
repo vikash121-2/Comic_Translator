@@ -6,6 +6,7 @@ import shutil
 import json
 import textwrap
 import torch
+import filetype
 import tempfile
 from typing import List, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageFile
@@ -140,12 +141,14 @@ async def json_maker_prompt_files(update: Update, context: ContextTypes.DEFAULT_
     return WAITING_FILES_OCR
 
 async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Files received. Processing...")
+    """Processes uploaded files, now with universal image type detection."""
+    await update.message.reply_text("Files received. Detecting all image types and processing...")
     lang_code = context.user_data.get('lang_code', 'en')
     ocr_reader = get_reader([lang_code, 'en'])
     if ocr_reader is None:
         await update.message.reply_text("Error: OCR model could not be loaded.")
         return await back_to_main_menu(update, context)
+
     with tempfile.TemporaryDirectory() as temp_dir:
         input_dir = Path(temp_dir)
         file_to_process = update.message.document or update.message.photo
@@ -158,10 +161,17 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
             if file_path.suffix.lower() == '.zip':
                 with zipfile.ZipFile(file_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
                 os.remove(file_path)
-        image_paths = list(input_dir.rglob('*.jpg')) + list(input_dir.rglob('*.jpeg')) + list(input_dir.rglob('*.png'))
+
+        # --- NEW: Universal Image Detection Logic ---
+        all_files = [p for p in input_dir.rglob('*') if p.is_file()]
+        image_paths = [p for p in all_files if filetype.is_image(p)]
+        logger.info(f"Detected {len(image_paths)} image files of various types.")
+        # --- END NEW ---
+
         if not image_paths:
-            await update.message.reply_text("No images found to process.")
+            await update.message.reply_text("No compatible image files were found in the upload.")
             return await back_to_main_menu(update, context)
+            
         all_text_data = []
         for img_path in sorted(image_paths):
             relative_path = img_path.relative_to(input_dir)
@@ -174,9 +184,11 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
                     all_text_data.append(text_entry)
             except Exception as e:
                 logger.error(f"Error processing {relative_path}: {e}")
+        
         json_path = input_dir / "extracted_text.json"
-        with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
-        await update.message.reply_document(document=open(json_path, 'rb'), caption=f"Extraction complete.")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(all_text_data, f, ensure_ascii=False, indent=4)
+        await update.message.reply_document(document=open(json_path, 'rb'), caption=f"Extraction complete. Processed {len(image_paths)} images.")
     cleanup_user_data(context)
     return await start(update, context)
 
