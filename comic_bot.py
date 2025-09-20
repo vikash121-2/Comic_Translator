@@ -184,9 +184,18 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
 # --- FEATURE 2: JSON TO COMIC TRANSLATE ---
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    # This keyboard should have both Image and Zip options
+    keyboard = [
+        [
+            InlineKeyboardButton("🖼️ Image Upload", callback_data="jt_image"),
+            InlineKeyboardButton("🗂️ Zip Upload", callback_data="jt_zip")
+        ],
+        [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await query.answer()
-    await query.edit_message_text("This feature applies translated text to a zip of images.\nPlease upload your translated JSON file first.")
-    return WAITING_JSON_TRANSLATE_ZIP
+    await query.edit_message_text("How would you like to apply translations?", reply_markup=reply_markup)
+    return JSON_TRANSLATE_CHOICE
 
 async def json_translate_get_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("JSON file received. Now, please upload the original .zip file with the images.")
@@ -308,6 +317,12 @@ def main() -> None:
             JSON_MAKER_CHOICE: [
                 CallbackQueryHandler(json_maker_prompt_files, pattern="^lang_"),
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
+            ],
+            # Inside the ConversationHandler states dictionary
+            JSON_TRANSLATE_CHOICE: [
+                CallbackQueryHandler(json_translate_prompt_json_for_img, pattern="^jt_image$"),
+                CallbackQueryHandler(json_translate_prompt_json_for_zip, pattern="^jt_zip$"),
+                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$")
             ],
             WAITING_FILES_OCR: [MessageHandler(filters.PHOTO | filters.Document.ALL, extract_text_from_files)],
             
