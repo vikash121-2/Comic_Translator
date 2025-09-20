@@ -7,12 +7,10 @@ import json
 import textwrap
 import torch
 import tempfile
-import asyncio
 from typing import List, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 from pathlib import Path
 import numpy as np
-import cv2
 import filetype
 
 from telegram import (
@@ -71,29 +69,19 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
         context.user_data['temp_dir_obj'].cleanup()
     context.user_data.clear()
 
-async def send_progress_update(message, processed_count, total_count, feature_name):
-    """Sends a progress update message, avoiding rate limits."""
-    try:
-        progress_text = f"[{feature_name}] Progress: {processed_count} / {total_count} images processed."
-        await message.edit_text(progress_text)
-        await asyncio.sleep(0.1)
-    except Exception as e:
-        logger.warning(f"Could not update progress message: {e}")
-
 def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str, max_font_size: int = 60):
-    """Draws wrapped, centered, auto-sized text with a white border."""
     box_width, box_height = box[2] - box[0], box[3] - box[1]
     if not text.strip() or box_width <= 10 or box_height <= 10: return
     font_size = max_font_size
-    
-    while font_size > 5:
-        try:
-            font = ImageFont.truetype(font_path, font_size)
-        except IOError:
-            logger.error(f"Could not load font: {font_path}")
-            draw.text((box[0], box[1]), "[Font Not Found]", fill="red")
-            return
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except IOError:
+        logger.error(f"Could not load font: {font_path}")
+        draw.text((box[0], box[1]), "[Font Not Found]", fill="red")
+        return
 
+    while font_size > 5:
+        font = ImageFont.truetype(font_path, font_size)
         avg_char_width = font.getlength("a")
         wrap_width = max(1, int(box_width / avg_char_width * 1.8)) if avg_char_width > 0 else 1
         wrapped_text = "\n".join(textwrap.wrap(text, width=wrap_width, break_long_words=True))
@@ -213,7 +201,7 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     return await start(update, context)
 
 async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    progress_message = await update.message.reply_text("Zip received. Unpacking and processing...")
+    progress_message = await update.message.reply_text("Zip file received. Unpacking and processing...")
     lang_code = context.user_data.get('lang_code', 'en')
     ocr_reader = get_reader(lang_code)
     if not ocr_reader:
