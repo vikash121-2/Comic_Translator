@@ -512,7 +512,7 @@ def main() -> None:
             WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json_for_zip)],
             WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
             JSON_DIVIDE_CHOICE: [
-                CallbackQueryHandler(json_divide_prompt_json, pattern="^jd_zip$"),
+                CallbackQueryHandler(json_divide_get_json, pattern="^jd_zip$"),
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$")
             ],
             WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.FileExtension("json"), json_divide_get_json)],
