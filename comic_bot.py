@@ -127,7 +127,7 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
     """Processes uploaded files (images or zip), extracts text, and returns a JSON."""
     await update.message.reply_text("Files received. Processing...")
     
-    lang_code = context.user_data.get('lang_code', 'en')
+    lang_code = context.user_data.get('lang_code', 'en') # Default to english if not set
     ocr_reader = get_reader([lang_code, 'en'])
     if ocr_reader is None:
         await update.message.reply_text("Error: OCR model could not be loaded. Please check the logs.")
@@ -164,7 +164,9 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
                 img_np = np.array(Image.open(img_path).convert("RGB"))
                 results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
 
-                for i, (bbox, text, prob) in enumerate(results):
+                # CORRECTED: The loop now correctly unpacks the 2 values (bbox, text)
+                # returned by paragraph mode. The confidence score (prob) is not available here.
+                for i, (bbox, text) in enumerate(results):
                     text_entry = {
                         "filename": str(relative_path).replace('\\', '/'),
                         "block_id": i,
@@ -184,7 +186,6 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
 
     cleanup_user_data(context)
     return await start(update, context)
-
 # --- 2. Json To Comic Translate Feature ---
 
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
