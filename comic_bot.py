@@ -323,32 +323,47 @@ def main() -> None:
             MAIN_MENU: [
                 CallbackQueryHandler(json_maker_menu, pattern="^main_json_maker$"),
                 CallbackQueryHandler(json_translate_menu, pattern="^main_translate$"),
-                # Add json_divide_menu handler here when ready
+                CallbackQueryHandler(json_divide_menu, pattern="^main_divide$"),
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"), 
             ],
             JSON_MAKER_CHOICE: [
-                CallbackQueryHandler(json_maker_prompt_files, pattern="^lang_"),
+                CallbackQueryHandler(json_maker_prompt_image, pattern="^jm_image$"),
+                CallbackQueryHandler(json_maker_prompt_zip, pattern="^jm_zip$"),
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
             ],
-            WAITING_FILES_OCR: [MessageHandler(filters.PHOTO | filters.Document.ALL, extract_text_from_files)],
-            
+            WAITING_IMAGES_OCR: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, collect_images),
+                CallbackQueryHandler(prompt_language, pattern="^jm_prompt_language$"),
+            ],
+            WAITING_ZIP_OCR: [MessageHandler(filters.Document.ZIP, json_maker_process_zip)],
+            SELECT_LANGUAGE: [
+                CallbackQueryHandler(process_images_with_selected_language, pattern="^lang_"),
+                CallbackQueryHandler(process_zip_with_selected_language, pattern="^lang_")
+            ],
             JSON_TRANSLATE_CHOICE: [
-                CallbackQueryHandler(json_translate_prompt_json, pattern="^jt_image$"),
-                CallbackQueryHandler(json_translate_prompt_json, pattern="^jt_zip$"),
-                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
+                CallbackQueryHandler(json_translate_prompt_json_for_img, pattern="^jt_image$"),
+                CallbackQueryHandler(json_translate_prompt_json_for_zip, pattern="^jt_zip$"),
+                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$")
             ],
-            WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json)],
-            WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
-            WAITING_JSON_TRANSLATE_IMG: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json_for_img)], # Should be same as zip
+            WAITING_JSON_TRANSLATE_IMG: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json_for_img)],
             WAITING_IMAGES_TRANSLATE: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, json_translate_collect_images),
                 CallbackQueryHandler(json_translate_process_images, pattern="^jt_process_images$"),
             ],
+            WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json_for_zip)],
+            WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
+            JSON_DIVIDE_CHOICE: [
+                CallbackQueryHandler(json_divide_prompt_json, pattern="^jd_zip$"),
+                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$")
+            ],
+            WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.FileExtension("json"), json_divide_get_json)],
+            WAITING_ZIP_DIVIDE: [MessageHandler(filters.Document.ZIP, json_divide_process_zip)],
         },
         fallbacks=[CommandHandler("start", start)],
     )
     application.add_handler(conv_handler)
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
