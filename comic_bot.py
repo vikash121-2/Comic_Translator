@@ -43,10 +43,11 @@ FONT_PATH = "ComicNeue-Bold.ttf"
     MAIN_MENU,
     JSON_MAKER_CHOICE, WAITING_FILES_OCR,
     JSON_TRANSLATE_CHOICE, 
+    WAITING_JSON_TRANSLATE_IMG, WAITING_IMAGES_TRANSLATE,
     WAITING_JSON_TRANSLATE_ZIP, WAITING_ZIP_TRANSLATE,
     JSON_DIVIDE_CHOICE, 
     WAITING_JSON_DIVIDE, WAITING_ZIP_DIVIDE
-) = range(9)
+) = range(11)
 
 # --- Global variables for OCR ---
 current_reader_langs = None
@@ -70,7 +71,7 @@ def get_reader(langs):
 
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
     """Cleans up temporary data."""
-    for key in ['temp_dir_obj', 'json_data', 'lang_code', 'zip_file']:
+    for key in ['temp_dir_obj', 'json_data', 'lang_code', 'received_images']:
         if key in context.user_data and hasattr(context.user_data.get(key), 'cleanup'):
             context.user_data[key].cleanup()
     context.user_data.clear()
@@ -182,14 +183,107 @@ async def extract_text_from_files(update: Update, context: ContextTypes.DEFAULT_
 # --- 2. Json To Comic Translate Feature ---
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    keyboard = [
+        [InlineKeyboardButton("🖼️ Image(s) Upload", callback_data="jt_image")],
+        [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jt_zip")],
+        [InlineKeyboardButton("« Back", callback_data="main_menu_start")]
+    ]
     await query.answer()
-    await query.edit_message_text("This feature applies translated text to a zip of images.\nPlease upload your translated JSON file first.")
-    return WAITING_JSON_TRANSLATE_ZIP
+    await query.edit_message_text("How would you like to apply translations?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return JSON_TRANSLATE_CHOICE
 
-async def json_translate_get_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("JSON file received. Now, please upload the original .zip file with the images.")
+async def json_translate_prompt_json_for_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("First, please upload the translated JSON file.")
+    return WAITING_JSON_TRANSLATE_IMG
+
+async def json_translate_get_json_for_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     json_file = await update.message.document.get_file()
     context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
+    context.user_data['temp_dir_obj'] = tempfile.TemporaryDirectory()
+    context.user_data['received_images'] = {}
+    await update.message.reply_text("JSON received. Now send the original images. Press 'Done' when finished.")
+    return WAITING_IMAGES_TRANSLATE
+
+async def json_translate_collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        temp_dir_path = context.user_data['temp_dir_obj'].name
+        received_images = context.user_data['received_images']
+    except KeyError:
+        await update.message.reply_text("Something went wrong. Please start over.")
+        return ConversationHandler.END
+    file_to_download, original_filename = (None, None)
+    if update.message.photo:
+        file_to_download = await update.message.photo[-1].get_file()
+        original_filename = f"photo_{file_to_download.file_id}.jpg"
+    elif update.message.document and update.message.document.mime_type.startswith('image/'):
+        file_to_download = await update.message.document.get_file()
+        original_filename = update.message.document.file_name
+    else: return WAITING_IMAGES_TRANSLATE
+    file_path = os.path.join(temp_dir_path, original_filename)
+    await file_to_download.download_to_drive(file_path)
+    received_images[original_filename] = file_path
+    keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="jt_process_images")]]
+    await update.message.reply_text(f"Image '{original_filename}' received. Send another, or press Done.", reply_markup=InlineKeyboardMarkup(keyboard))
+    return WAITING_IMAGES_TRANSLATE
+
+async def json_translate_process_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Applying translations to images...")
+    json_data = context.user_data.get('json_data', [])
+    received_images = context.user_data.get('received_images', {})
+    if not received_images:
+        await query.edit_message_text("You didn't send any images! Please start over.")
+        return await back_to_main_menu(update, context)
+    if not os.path.exists(FONT_PATH):
+        await context.bot.send_message(chat_id=query.message.chat.id, text=f"CRITICAL ERROR: Font file '{FONT_PATH}' not found!")
+        return await back_to_main_menu(update, context)
+    images_processed_count = 0
+    translations_by_file = {}
+    for entry in json_data:
+        fname = entry['filename']
+        if fname not in translations_by_file: translations_by_file[fname] = []
+        translations_by_file[fname].append(entry)
+    for uploaded_filename, image_path in received_images.items():
+        # The filename in JSON is the one we need to match against
+        # This logic is imperfect for photos, as their original filename is lost.
+        # It works best if user uploads images as files.
+        matched_translations = translations_by_file.get(uploaded_filename)
+        if matched_translations:
+            img = Image.open(image_path).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            for entry in matched_translations:
+                bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
+                x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
+                simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                draw.rectangle(simple_box, fill="white", outline="black", width=1)
+                if translated_text:
+                    draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
+            bio = io.BytesIO()
+            bio.name = f"translated_{uploaded_filename}"
+            img.save(bio, 'JPEG')
+            bio.seek(0)
+            await context.bot.send_document(chat_id=query.message.chat.id, document=bio)
+            images_processed_count += 1
+    if images_processed_count == 0:
+        await context.bot.send_message(chat_id=query.message.chat.id, text="Warning: No matching filenames found between your JSON and uploaded images.")
+    else:
+        await context.bot.send_message(chat_id=query.message.chat.id, text="Translation complete!")
+    cleanup_user_data(context)
+    return await start(update, context)
+
+async def json_translate_prompt_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Please upload the translated JSON file.")
+    return WAITING_JSON_TRANSLATE_ZIP
+
+async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    json_file = await update.message.document.get_file()
+    context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
+    await update.message.reply_text("JSON file received. Now, please upload the original .zip file.")
     return WAITING_ZIP_TRANSLATE
 
 async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -307,12 +401,22 @@ def main() -> None:
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
             ],
             WAITING_FILES_OCR: [MessageHandler(filters.PHOTO | filters.Document.ALL, extract_text_from_files)],
-            
-            # Note: The 'json translate' for single images was complex and removed for this stable version.
-            # It can be added back if needed, but the zip workflow is more robust.
-            WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json)],
+            JSON_TRANSLATE_CHOICE: [
+                CallbackQueryHandler(json_translate_prompt_json_for_img, pattern="^jt_image$"),
+                CallbackQueryHandler(json_translate_prompt_json_for_zip, pattern="^jt_zip$"),
+                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
+            ],
+            WAITING_JSON_TRANSLATE_IMG: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json_for_img)],
+            WAITING_IMAGES_TRANSLATE: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, json_translate_collect_images),
+                CallbackQueryHandler(json_translate_process_images, pattern="^jt_process_images$"),
+            ],
+            WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json_for_zip)],
             WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
-
+            JSON_DIVIDE_CHOICE: [
+                CallbackQueryHandler(json_divide_menu, pattern="^jd_zip$"), # This should be json_divide_prompt_json
+                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$")
+            ],
             WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.FileExtension("json"), json_divide_get_json)],
             WAITING_ZIP_DIVIDE: [MessageHandler(filters.Document.ZIP, json_divide_process_zip)],
         },
