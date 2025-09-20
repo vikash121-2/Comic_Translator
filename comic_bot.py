@@ -229,7 +229,7 @@ async def json_translate_collect_images(update: Update, context: ContextTypes.DE
     return WAITING_IMAGES_TRANSLATE
 
 async def json_translate_process_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Processes collected images for translation."""
+    """Processes collected images for translation with corrected bounding box logic."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Applying translations to images...")
@@ -247,7 +247,6 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
         return await back_to_main_menu(update, context)
 
     images_processed_count = 0
-    # Group translations by filename from the flat JSON list
     translations_by_file = {}
     for entry in json_data:
         fname = entry['filename']
@@ -259,12 +258,19 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
             img = Image.open(image_path).convert("RGB")
             draw = ImageDraw.Draw(img)
             for entry in translations_by_file[filename]:
-                bbox = entry['bbox']
+                bbox_points = entry['bbox']
                 translated_text = entry.get('translated_text', '').strip()
-                top_left, bottom_right = tuple(bbox[0]), tuple(bbox[2])
-                draw.rectangle([top_left, bottom_right], fill="white", outline="black", width=1)
+
+                # --- THIS IS THE FIX ---
+                # Correctly calculate the simple bounding box from the 4 corner points
+                x_coords = [p[0] for p in bbox_points]
+                y_coords = [p[1] for p in bbox_points]
+                simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                # --- END OF FIX ---
+
+                draw.rectangle(simple_box, fill="white", outline="black", width=1)
                 if translated_text:
-                    draw_text_in_box(draw, [top_left[0], top_left[1], bottom_right[0], bottom_right[1]], translated_text, FONT_PATH)
+                    draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
             
             bio = io.BytesIO()
             bio.name = f"translated_{filename}"
@@ -295,10 +301,69 @@ async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.
     return WAITING_ZIP_TRANSLATE
 
 async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # This is now the handler for the zip file after the JSON has been received.
+    """Processes a zip file for translation with corrected bounding box logic."""
     await update.message.reply_text("Zip file received. Applying translations...")
-    # ... (The rest of the zip processing logic from the Gradio script version)
-    pass
+    json_data = context.user_data.get('json_data')
+    if not json_data:
+        await update.message.reply_text("Error: JSON data was lost. Please start over.")
+        return await back_to_main_menu(update, context)
+        
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_dir = Path(temp_dir) / "input"
+        output_dir = Path(temp_dir) / "output"
+        input_dir.mkdir(); output_dir.mkdir()
+        
+        zip_tg_file = await update.message.document.get_file()
+        zip_path = input_dir / "images.zip"
+        await zip_tg_file.download_to_drive(zip_path)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(input_dir)
+
+        translations_by_file = {}
+        for entry in json_data:
+            fname = entry['filename']
+            if fname not in translations_by_file: translations_by_file[fname] = []
+            translations_by_file[fname].append(entry)
+        
+        try:
+            font = ImageFont.truetype(FONT_PATH, 40)
+        except IOError:
+            await update.message.reply_text(f"Error: Font '{FONT_PATH}' not found.")
+            return await back_to_main_menu(update, context)
+
+        for rel_path_str, translations in translations_by_file.items():
+            img_path = input_dir / Path(rel_path_str)
+            if not img_path.exists():
+                logger.warning(f"Image '{rel_path_str}' from JSON not found.")
+                continue
+
+            img = Image.open(img_path).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            for entry in translations:
+                bbox_points = entry['bbox']
+                translated_text = entry.get('translated_text', '').strip()
+
+                # --- THIS IS THE FIX ---
+                # Correctly calculate the simple bounding box from the 4 corner points
+                x_coords = [p[0] for p in bbox_points]
+                y_coords = [p[1] for p in bbox_points]
+                simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                # --- END OF FIX ---
+                
+                draw.rectangle(simple_box, fill="white", outline="black", width=1)
+                if translated_text:
+                    draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
+
+            output_path = output_dir / Path(rel_path_str)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            img.save(output_path)
+
+        zip_path_str = os.path.join(temp_dir, "final_translated_comics")
+        shutil.make_archive(zip_path_str, 'zip', output_dir)
+        await update.message.reply_document(document=open(f"{zip_path_str}.zip", 'rb'), caption="Processing complete!")
+    
+    cleanup_user_data(context)
+    return await start(update, context)
 
 
 def main() -> None:
