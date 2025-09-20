@@ -202,20 +202,24 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
 
     with tempfile.TemporaryDirectory() as temp_dir:
         input_dir = Path(temp_dir)
-        tg_file = await update.message.document.get_file()
-        file_path = input_dir / tg_file.file_name
+        
+        # --- THIS IS THE FIX ---
+        # Get the document object from the message first
+        document = update.message.document
+        # Get the filename from the document object
+        file_name = document.file_name
+        # Now, get the file to download
+        tg_file = await document.get_file()
+        # --- END OF FIX ---
+
+        file_path = input_dir / file_name
         await tg_file.download_to_drive(file_path)
         
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
             zip_ref.extractall(input_dir)
         os.remove(file_path)
 
-        # --- THIS IS THE FIX ---
-        # First, find all paths, then filter to only include files before checking their type.
-        all_paths = input_dir.rglob('*')
-        image_paths = [p for p in all_paths if p.is_file() and filetype.is_image(p)]
-        # --- END OF FIX ---
-
+        image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
         if not image_paths:
             await update.message.reply_text("No compatible images found in the zip.")
             return await back_to_main_menu(update, context)
@@ -240,7 +244,7 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
 
     cleanup_user_data(context)
     return await start(update, context)
-
+    
 # --- 2. Json To Comic Translate ---
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
