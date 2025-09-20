@@ -73,28 +73,21 @@ def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str,
     box_width, box_height = box[2] - box[0], box[3] - box[1]
     if not text.strip() or box_width <= 10 or box_height <= 10: return
     font_size = max_font_size
-    try:
-        font = ImageFont.truetype(font_path, font_size)
+    try: font = ImageFont.truetype(font_path, font_size)
     except IOError:
         logger.error(f"Could not load font: {font_path}")
         draw.text((box[0], box[1]), "[Font Not Found]", fill="red")
         return
-
     while font_size > 5:
-        font = ImageFont.truetype(font_path, font_size)
         avg_char_width = font.getlength("a")
         wrap_width = max(1, int(box_width / avg_char_width * 1.8)) if avg_char_width > 0 else 1
         wrapped_text = "\n".join(textwrap.wrap(text, width=wrap_width, break_long_words=True))
         text_bbox = draw.multiline_textbbox((0, 0), wrapped_text, font=font, spacing=4)
         text_width = text_bbox[2] - text_bbox[0]
         text_height = text_bbox[3] - text_bbox[1]
-        if text_height <= box_height and text_width <= box_width:
-            break
+        if text_height <= box_height and text_width <= box_width: break
         font_size -= 2
-    
-    x = box[0] + (box_width - text_width) / 2
-    y = box[1] + (box_height - text_height) / 2
-    
+    x, y = box[0] + (box_width - text_width) / 2, box[1] + (box_height - text_height) / 2
     border_color = "white"
     draw.multiline_text((x-1, y-1), wrapped_text, font=font, fill=border_color, align="center", spacing=4)
     draw.multiline_text((x+1, y-1), wrapped_text, font=font, fill=border_color, align="center", spacing=4)
@@ -201,7 +194,7 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     return await start(update, context)
 
 async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    progress_message = await update.message.reply_text("Zip file received. Unpacking and processing...")
+    progress_message = await update.message.reply_text("Zip received. Unpacking and processing...")
     lang_code = context.user_data.get('lang_code', 'en')
     ocr_reader = get_reader(lang_code)
     if not ocr_reader:
@@ -405,8 +398,15 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
 # --- 3. Json Divide Feature ---
 async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    keyboard = [[InlineKeyboardButton("🗂️ Zip Upload", callback_data="jd_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
     await query.answer()
-    await query.edit_message_text("This feature requires a master JSON and a zip file.\nPlease upload the master JSON file first.")
+    await query.edit_message_text("This feature requires a master JSON and a zip file.\nPlease upload the master JSON file first.", reply_markup=InlineKeyboardMarkup(keyboard))
+    return JSON_DIVIDE_CHOICE
+
+async def json_divide_prompt_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Please upload the master JSON file.")
     return WAITING_JSON_DIVIDE
 
 async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
