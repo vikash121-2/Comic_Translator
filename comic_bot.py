@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
+
 FONT_PATH = "ComicNeue-Bold.ttf"
 
 # --- CONVERSATION STATES ---
@@ -506,10 +507,6 @@ def main() -> None:
             ],
             WAITING_JSON_TRANSLATE_ZIP: [MessageHandler(filters.Document.FileExtension("json"), json_translate_get_json_for_zip)],
             WAITING_ZIP_TRANSLATE: [MessageHandler(filters.Document.ZIP, json_translate_process_zip)],
-            JSON_DIVIDE_CHOICE: [
-                CallbackQueryHandler(json_divide_prompt_json, pattern="^jd_zip$"),
-                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$")
-            ],
             WAITING_JSON_DIVIDE: [MessageHandler(filters.Document.FileExtension("json"), json_divide_get_json)],
             WAITING_ZIP_DIVIDE: [MessageHandler(filters.Document.ZIP, json_divide_process_zip)],
         },
