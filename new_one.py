@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFile
 from pathlib import Path
 import numpy as np
 import filetype
+from pathlib import Path  # Make sure Path is imported
 
 from telegram import (
     Update,
@@ -36,6 +37,14 @@ logger = logging.getLogger(__name__)
 # --- CONFIGURATION ---
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
 FONT_PATH = "ComicNeue-Bold.ttf"
+
+# ADD THESE LINES
+# Define the directory where the script is located
+SCRIPT_DIR = Path(__file__).resolve().parent
+# Define a sub-folder to keep all temporary files organized
+TEMP_ROOT_DIR = SCRIPT_DIR / "temp_processing"
+# Create this folder if it doesn't exist
+TEMP_ROOT_DIR.mkdir(exist_ok=True)
 
 # --- CONVERSATION STATES ---
 (
@@ -231,7 +240,7 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
     if not ocr_reader:
         await progress_message.edit_text("Error: OCR model could not be loaded.")
         return await back_to_main_menu(update, context)
-    with tempfile.TemporaryDirectory() as temp_dir:
+    with tempfile.TemporaryDirectory(dir=TEMP_ROOT_DIR) as temp_dir:
         input_dir = Path(temp_dir)
         document = update.message.document
         file_name = document.file_name
@@ -282,7 +291,7 @@ async def json_translate_prompt_json_for_img(update: Update, context: ContextTyp
 async def json_translate_get_json_for_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     json_file = await update.message.document.get_file()
     context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
-    context.user_data['temp_dir_obj'] = tempfile.TemporaryDirectory()
+    context.user_data['temp_dir_obj'] = tempfile.TemporaryDirectory(dir=TEMP_ROOT_DIR)
     context.user_data['received_images'] = {}
     await update.message.reply_text("JSON received. Now send the original images. Press 'Done' when finished.")
     return WAITING_IMAGES_TRANSLATE
