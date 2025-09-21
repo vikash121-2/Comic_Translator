@@ -12,7 +12,6 @@ from PIL import Image, ImageDraw, ImageFont, ImageFile
 from pathlib import Path
 import numpy as np
 import filetype
-import cv2  # <--- ADD THIS LINE
 
 from telegram import (
     Update,
@@ -403,7 +402,8 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
             if fname not in translations_by_file: translations_by_file[fname] = []
             translations_by_file[fname].append(entry)
             
-        all_image_paths = [p for p in input_dir.rglob('*') if filetype.is_image(p)]
+        # Only include files; avoid passing directories to filetype.is_image which causes IsADirectoryError
+        all_image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
         total_images, processed_count = len(all_image_paths), 0
         
         for img_path in sorted(all_image_paths):
