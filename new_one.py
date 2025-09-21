@@ -53,7 +53,7 @@ FONT_PATH = "ComicNeue-Bold.ttf"
 readers = {}
 def get_reader(lang_code):
     global readers
-    if lang_code not in readers:
+    if (lang_code not in readers):
         try:
             import easyocr
             logger.info(f"Initializing EasyOCR for language: {lang_code}...")
@@ -73,75 +73,7 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
 # --- HELPER FUNCTIONS ---
 
 def mask_solid_color_areas(img_cv, blocks_on_image):
-    """
-    For each OCR text polygon, estimate the local background color by sampling
-    a thin ring just outside the polygon. If that ring is sufficiently uniform
-    (low color variance), fill the polygon with the estimated background color.
-
-    This works for solid background panels, simple text boxes, and speech bubbles.
-    """
-    if img_cv is None or len(blocks_on_image) == 0:
-        return img_cv
-
-    img_height, img_width = img_cv.shape[:2]
-
-    # Tunable params
-    COLOR_STD_DEV_THRESHOLD = 18.0  # how uniform the ring must be
-    MIN_RING_PIXELS = 50            # ensure enough samples
-    PADDING = 10                    # expand analysis window
-
-    for entry in blocks_on_image:
-        bbox_points = np.array(entry['bbox'], dtype=np.int32)
-        if bbox_points.ndim != 2 or bbox_points.shape[0] < 3:
-            continue
-
-        # Bounding rect for local crop
-        x, y, w, h = cv2.boundingRect(bbox_points)
-        bx1 = max(0, x - PADDING)
-        by1 = max(0, y - PADDING)
-        bx2 = min(img_width, x + w + PADDING)
-        by2 = min(img_height, y + h + PADDING)
-        if bx2 <= bx1 or by2 <= by1:
-            continue
-
-        border_area = img_cv[by1:by2, bx1:bx2]
-        if border_area.size == 0:
-            continue
-
-        # Shift polygon to local coords
-        shifted_bbox = bbox_points - np.array([bx1, by1], dtype=np.int32)
-
-        # Base mask: filled polygon
-        inner_mask = np.zeros(border_area.shape[:2], dtype=np.uint8)
-        cv2.fillPoly(inner_mask, [shifted_bbox], 255)
-
-        # Create a narrow ring just outside the polygon using dilation
-        # Ring thickness is relative to box size, clamped to reasonable range
-        est_size = max(w, h)
-        ring_thickness = max(2, min(8, int(0.08 * est_size)))
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring_thickness + 1, 2 * ring_thickness + 1))
-        dilated = cv2.dilate(inner_mask, kernel)
-        ring_mask = cv2.subtract(dilated, inner_mask)
-
-        # If the ring is too small (e.g., near edges), fall back to using the border area outside the polygon
-        if int(cv2.countNonZero(ring_mask)) < MIN_RING_PIXELS:
-            outside_mask = cv2.bitwise_not(inner_mask)
-            sample_mask = outside_mask
-        else:
-            sample_mask = ring_mask
-
-        # Compute mean and stddev on selected mask
-        mean_color, std_dev = cv2.meanStdDev(border_area, mask=sample_mask)
-        # Guard against None returns
-        if mean_color is None or std_dev is None:
-            continue
-
-        # Average std across channels
-        avg_std = float(np.mean(std_dev))
-        if avg_std < COLOR_STD_DEV_THRESHOLD:
-            fill_color = (int(mean_color[0][0]), int(mean_color[1][0]), int(mean_color[2][0]))
-            cv2.fillPoly(img_cv, [bbox_points], fill_color)
-
+    """Masking disabled: return image unchanged."""
     return img_cv
 
 
@@ -195,9 +127,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
     elif update.callback_query:
         query = update.callback_query
-        try: await query.answer()
-        except BadRequest: logger.info("Callback query already answered.")
-        await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await query.answer()
+        except BadRequest:
+            logger.info("Callback query already answered.")
+        try:
+            await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except BadRequest as e:
+            # If the original message is gone (deleted) or not editable, send a fresh message
+            logger.info(f"edit_message_text failed in start(): {e}")
+            if update.effective_chat:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=message_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
     return MAIN_MENU
 
 async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -392,14 +336,8 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
         matched_translations = translations_by_file.get(uploaded_filename) or translations_by_file.get(Path(uploaded_filename).name)
         
         if matched_translations:
-            img_cv = cv2.imread(image_path)
-            
-            # --- MODIFICATION START ---
-            # Call the new function to intelligently mask only solid color areas
-            masked_img_cv = mask_solid_color_areas(img_cv, matched_translations)
-            # --- MODIFICATION END ---
-
-            img = Image.fromarray(cv2.cvtColor(masked_img_cv, cv2.COLOR_BGR2RGB))
+            # Open original image (no masking)
+            img = Image.open(image_path).convert("RGB")
             draw = ImageDraw.Draw(img)
             
             for entry in matched_translations:
@@ -407,6 +345,9 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
                 if translated_text:
                     x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
                     simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                    # Draw a solid white rectangle behind the text
+                    draw.rectangle(simple_box, fill="white")
+                    # Now draw black text (function already draws with white outline + black fill)
                     draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
             
             bio = io.BytesIO()
@@ -424,7 +365,7 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
     
     cleanup_user_data(context)
     return await start(update, context)
-    
+
 async def json_translate_prompt_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -472,14 +413,8 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
             output_img_path.parent.mkdir(parents=True, exist_ok=True)
             
             if matched_translations:
-                img_cv = cv2.imread(str(img_path))
-
-                # --- MODIFICATION START ---
-                # Call the new function to intelligently mask only solid color areas
-                masked_img_cv = mask_solid_color_areas(img_cv, matched_translations)
-                # --- MODIFICATION END ---
-                
-                img = Image.fromarray(cv2.cvtColor(masked_img_cv, cv2.COLOR_BGR2RGB))
+                # Open original image (no masking)
+                img = Image.open(str(img_path)).convert("RGB")
                 draw = ImageDraw.Draw(img)
                 
                 for entry in matched_translations:
@@ -487,6 +422,9 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
                     if translated_text:
                         x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
                         simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                        # Draw a solid white rectangle behind the text
+                        draw.rectangle(simple_box, fill="white")
+                        # Now draw black text
                         draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
                 img.save(output_img_path)
             else:
@@ -525,7 +463,7 @@ async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAITING_ZIP_DIVIDE
 
 async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    progress_message = await update.message.reply_text("Zip file received. Dividing JSON and masking images...")
+    progress_message = await update.message.reply_text("Zip file received. Dividing JSON...")
     json_data = context.user_data.get('json_data')
     if not json_data:
         await progress_message.edit_text("Error: JSON data was lost.")
@@ -540,40 +478,21 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
         await zip_tg_file.download_to_drive(zip_path)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(working_dir)
         
-        blocks_by_folder, all_images_to_process = {}, set()
+        blocks_by_folder = {}
         for entry in json_data:
             p = Path(entry['filename'])
             folder_name = str(p.parent)
             if folder_name not in blocks_by_folder: blocks_by_folder[folder_name] = []
             blocks_by_folder[folder_name].append(entry)
-            all_images_to_process.add(entry['filename'])
-            
-        total_images, processed_count = len(all_images_to_process), 0
         
+        # Write per-folder JSON files; do not modify images
         for folder_rel_path, blocks in blocks_by_folder.items():
             folder_abs_path = working_dir / Path(folder_rel_path)
-            if not folder_abs_path.is_dir(): continue
-            
+            if not folder_abs_path.is_dir():
+                continue
             folder_json_path = folder_abs_path / "folder_text.json"
-            with open(folder_json_path, 'w', encoding='utf-8') as f: json.dump(blocks, f, ensure_ascii=False, indent=4)
-            
-            images_in_folder = {b['filename'] for b in blocks}
-            for img_rel_path in images_in_folder:
-                img_path = working_dir / Path(img_rel_path)
-                if img_path.exists():
-                    img_cv = cv2.imread(str(img_path))
-
-                    # --- MODIFICATION START ---
-                    # Get all text blocks for the current image
-                    blocks_for_this_image = [b for b in blocks if b['filename'] == img_rel_path]
-                    # Call the new function to intelligently mask only solid color areas
-                    masked_img_cv = mask_solid_color_areas(img_cv, blocks_for_this_image)
-                    cv2.imwrite(str(img_path), masked_img_cv)
-                    # --- MODIFICATION END ---
-                    
-                    processed_count +=1
-                    if processed_count % 5 == 0 or processed_count == total_images:
-                        await send_progress_update(progress_message, processed_count, total_images, "Masking")
+            with open(folder_json_path, 'w', encoding='utf-8') as f:
+                json.dump(blocks, f, ensure_ascii=False, indent=4)
 
         zip_path_str = os.path.join(temp_dir, "final_divided_comics")
         shutil.make_archive(zip_path_str, 'zip', working_dir)
@@ -583,9 +502,26 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
     cleanup_user_data(context)
     return await start(update, context)
     
+aSYNC_ERROR_MSG = "An internal error occurred. Please try again."
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        logger.exception("Unhandled exception in handler", exc_info=context.error)
+    except Exception as e:
+        # Fallback logging
+        logger.error(f"Failed to log exception: {e}")
+    # Do not spam users; optionally inform if desired
+    # if update and hasattr(update, 'effective_chat') and update.effective_chat:
+    #     try:
+    #         await context.bot.send_message(chat_id=update.effective_chat.id, text=aSYNC_ERROR_MSG)
+    #     except Exception:
+    #         pass
+
 # --- APPLICATION SETUP ---
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
+    # Register a global error handler
+    application.add_error_handler(error_handler)
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
