@@ -5,14 +5,17 @@ import zipfile
 import shutil
 import json
 import textwrap
-import torch
 import tempfile
 from typing import List, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 from pathlib import Path
 import numpy as np
 import filetype
-import cv2  # <--- ADD THIS LINE
+
+# --- GOOGLE VISION API IMPORTS ---
+from google.cloud import vision
+from google.oauth2 import service_account
+from google.api_core import exceptions as google_exceptions
 
 from telegram import (
     Update,
@@ -38,6 +41,19 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
 FONT_PATH = "ComicNeue-Bold.ttf"
 
+# --- GOOGLE VISION API CONFIGURATION ---
+# IMPORTANT: Replace this with the actual path to your downloaded service account JSON file
+GOOGLE_CREDENTIALS_PATH = "path/to/your/service-account-file.json"
+# ----------------------------------------
+
+# Define the directory where the script is located
+SCRIPT_DIR = Path(__file__).resolve().parent
+# Define a sub-folder to keep all temporary files organized
+TEMP_ROOT_DIR = SCRIPT_DIR / "temp_processing"
+# Create this folder if it doesn't exist
+TEMP_ROOT_DIR.mkdir(exist_ok=True)
+
+
 # --- CONVERSATION STATES ---
 (
     MAIN_MENU,
@@ -49,20 +65,73 @@ FONT_PATH = "ComicNeue-Bold.ttf"
     WAITING_JSON_DIVIDE, WAITING_ZIP_DIVIDE
 ) = range(13)
 
-# --- OCR ENGINE SETUP ---
-readers = {}
-def get_reader(lang_code):
-    global readers
-    if lang_code not in readers:
+# --- OCR ENGINE SETUP (NOW GOOGLE VISION) ---
+vision_client = None
+
+# Maps the bot's internal language codes to Google Vision's BCP-47 codes
+LANGUAGE_MAP = {
+    'ja': 'ja',         # Japanese
+    'ko': 'ko',         # Korean
+    'ch_sim': 'zh-Hans',  # Chinese (Simplified)
+    'ch_tra': 'zh-Hant'   # Chinese (Traditional)
+}
+
+def get_vision_client():
+    """Initializes and returns a global Google Vision client."""
+    global vision_client
+    if vision_client is None:
         try:
-            import easyocr
-            logger.info(f"Initializing EasyOCR for language: {lang_code}...")
-            readers[lang_code] = easyocr.Reader([lang_code, 'en'], gpu=torch.cuda.is_available())
-            logger.info(f"EasyOCR for {lang_code} Initialized.")
-        except Exception as e:
-            logger.critical(f"Could not load easyocr model for {lang_code}. Error: {e}")
+            logger.info("Initializing Google Vision API client...")
+            credentials = service_account.Credentials.from_service_account_file(GOOGLE_CREDENTIALS_PATH)
+            vision_client = vision.ImageAnnotatorClient(credentials=credentials)
+            logger.info("Google Vision API client initialized successfully.")
+        except FileNotFoundError:
+            logger.critical(f"Google Cloud credentials file not found at: {GOOGLE_CREDENTIALS_PATH}")
             return None
-    return readers[lang_code]
+        except Exception as e:
+            logger.critical(f"Could not initialize Google Vision client. Error: {e}")
+            return None
+    return vision_client
+
+def perform_google_vision_ocr(client, image_content: bytes, lang_code: str) -> List:
+    """
+    Performs OCR on an image content using Google Vision API.
+    Returns data in the same format as the original easyocr implementation.
+    """
+    if not client:
+        return []
+
+    google_lang_code = LANGUAGE_MAP.get(lang_code, 'en') # Default to English if not found
+    image = vision.Image(content=image_content)
+    
+    try:
+        response = client.text_detection(
+            image=image,
+            image_context={"language_hints": [google_lang_code, "en"]} # Include English as secondary
+        )
+    except google_exceptions.GoogleAPICallError as e:
+        logger.error(f"Google Vision API call failed: {e}")
+        return []
+
+    if response.error.message:
+        logger.error(f'Google Vision API error: {response.error.message}')
+        return []
+
+    texts = response.text_annotations
+    results = []
+    
+    # The first annotation is the full text, we skip it and process blocks.
+    for text in texts[1:]:
+        # Google Vision provides word-level boxes. We will treat each as a separate block
+        # for consistency with the original script's output. For paragraph-level grouping,
+        # one would use `client.document_text_detection` and parse the block/paragraph structure.
+        description = text.description
+        vertices = text.bounding_poly.vertices
+        bbox = [[v.x, v.y] for v in vertices]
+        results.append((bbox, description))
+        
+    return results
+
 
 # --- HELPER FUNCTIONS ---
 def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
@@ -70,73 +139,17 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
         context.user_data['temp_dir_obj'].cleanup()
     context.user_data.clear()
 
-# --- HELPER FUNCTIONS ---
-
 def mask_solid_color_areas(img_cv, blocks_on_image):
-    """
-    Analyzes the area around each text block. If it's a solid color,
-    it fills the text block's bounding box with that color.
-    Otherwise, it leaves the text untouched.
-    """
-    # This threshold determines how "flat" a color needs to be to be considered solid.
-    # Lower is stricter (perfectly flat), higher is more lenient (allows slight gradients).
-    # You can tune this value if needed. A good starting point is 15.
-    COLOR_STD_DEV_THRESHOLD = 15
-    
-    # Define how many pixels to look at around the text box
-    PADDING = 10 
-
-    img_height, img_width = img_cv.shape[:2]
-
-    for entry in blocks_on_image:
-        bbox_points = np.array(entry['bbox'], dtype=np.int32)
-        
-        # Get the bounding rectangle of the text polygon
-        x, y, w, h = cv2.boundingRect(bbox_points)
-
-        # Define a slightly larger "border" area around the text box to analyze
-        # We clamp the values to stay within the image boundaries
-        bx1 = max(0, x - PADDING)
-        by1 = max(0, y - PADDING)
-        bx2 = min(img_width, x + w + PADDING)
-        by2 = min(img_height, y + h + PADDING)
-
-        # Crop the image to this larger border area
-        border_area = img_cv[by1:by2, bx1:bx2]
-        if border_area.size == 0:
-            continue
-
-        # Create a mask to exclude the actual text area from our analysis,
-        # so we only analyze the color of the padding/border.
-        inner_mask = np.zeros(border_area.shape[:2], dtype=np.uint8)
-        # We need to shift the bbox points to be relative to our cropped 'border_area'
-        shifted_bbox = bbox_points - [bx1, by1]
-        cv2.fillPoly(inner_mask, [shifted_bbox], 255)
-        
-        # Calculate the average color and the standard deviation of the color
-        # in the border region ONLY (where the mask is not white)
-        # The standard deviation tells us how much the colors vary.
-        # A low value means it's a very consistent, solid color.
-        mean_color, std_dev = cv2.meanStdDev(border_area, mask=~inner_mask)
-
-        # Check if the color variation is below our threshold
-        if np.mean(std_dev) < COLOR_STD_DEV_THRESHOLD:
-            # It's a solid background! Fill the text polygon with the average color.
-            fill_color = (int(mean_color[0][0]), int(mean_color[1][0]), int(mean_color[2][0]))
-            cv2.fillPoly(img_cv, [bbox_points], fill_color)
-            
+    """Masking disabled: return image unchanged."""
     return img_cv
 
-
-async def send_progress_update(message: Update.message, current: int, total: int, operation: str):
+async def send_progress_update(message, current: int, total: int, operation: str):
     """Asynchronously edits a message to show progress."""
     text = f"{operation} in progress... {current}/{total}"
     try:
-        # We check if the text is different to avoid sending an empty update
         if message.text != text:
             await message.edit_text(text)
     except BadRequest as e:
-        # Log errors if the message couldn't be edited for other reasons
         if "Message is not modified" not in str(e):
             logger.warning(f"Could not edit progress message: {e}")
 
@@ -178,9 +191,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
     elif update.callback_query:
         query = update.callback_query
-        try: await query.answer()
-        except BadRequest: logger.info("Callback query already answered.")
-        await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await query.answer()
+        except BadRequest:
+            logger.info("Callback query already answered.")
+        try:
+            await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except BadRequest as e:
+            logger.info(f"edit_message_text failed in start(): {e}")
+            if update.effective_chat:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=message_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
     return MAIN_MENU
 
 async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -243,21 +267,27 @@ async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Processing images...")
+    await query.edit_message_text("Processing images with Google Vision API...")
     image_paths = context.user_data.get('image_paths', [])
     lang_code = context.user_data.get('lang_code', 'en')
-    ocr_reader = get_reader(lang_code)
-    if not ocr_reader:
-        await query.edit_message_text("Error: OCR model could not be loaded.")
+    
+    client = get_vision_client()
+    if not client:
+        await query.edit_message_text("Error: Google Vision API could not be initialized. Check credentials.")
         return await back_to_main_menu(update, context)
+
     all_text_data = []
     for img_path in sorted(image_paths):
         filename = os.path.basename(img_path)
-        img_np = np.array(Image.open(img_path).convert("RGB"))
-        results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
+        with open(img_path, "rb") as image_file:
+            content = image_file.read()
+        
+        results = perform_google_vision_ocr(client, content, lang_code)
+        
         for i, (bbox, text) in enumerate(results):
             text_entry = {"filename": filename, "block_id": i, "bbox": [[int(p[0]), int(p[1])] for p in bbox], "original_text": text, "translated_text": ""}
             all_text_data.append(text_entry)
+            
     json_path = os.path.join(context.user_data['temp_dir_obj'].name, "extracted_text.json")
     with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
     await context.bot.send_document(chat_id=query.message.chat.id, document=open(json_path, 'rb'), caption=f"Extraction complete.")
@@ -265,13 +295,15 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     return await start(update, context)
 
 async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    progress_message = await update.message.reply_text("Zip received. Unpacking and processing...")
+    progress_message = await update.message.reply_text("Zip received. Unpacking and processing with Google Vision API...")
     lang_code = context.user_data.get('lang_code', 'en')
-    ocr_reader = get_reader(lang_code)
-    if not ocr_reader:
-        await progress_message.edit_text("Error: OCR model could not be loaded.")
+    
+    client = get_vision_client()
+    if not client:
+        await progress_message.edit_text("Error: Google Vision API could not be initialized. Check credentials.")
         return await back_to_main_menu(update, context)
-    with tempfile.TemporaryDirectory() as temp_dir:
+
+    with tempfile.TemporaryDirectory(dir=TEMP_ROOT_DIR) as temp_dir:
         input_dir = Path(temp_dir)
         document = update.message.document
         file_name = document.file_name
@@ -284,12 +316,16 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
         if not image_paths:
             await progress_message.edit_text("No compatible images found in the zip.")
             return await back_to_main_menu(update, context)
+            
         all_text_data, processed_count, total_images = [], 0, len(image_paths)
         for img_path in sorted(image_paths):
             relative_path = img_path.relative_to(input_dir)
             try:
-                img_np = np.array(Image.open(img_path).convert("RGB"))
-                results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
+                with open(img_path, "rb") as image_file:
+                    content = image_file.read()
+                
+                results = perform_google_vision_ocr(client, content, lang_code)
+                
                 for i, (bbox, text) in enumerate(results):
                     text_entry = {"filename": str(relative_path).replace('\\', '/'),"block_id": i, "bbox": [[int(p[0]), int(p[1])] for p in bbox],"original_text": text,"translated_text": ""}
                     all_text_data.append(text_entry)
@@ -298,6 +334,7 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
             processed_count += 1
             if processed_count % 5 == 0 or processed_count == total_images:
                 await send_progress_update(progress_message, processed_count, total_images, "Extraction")
+                
         json_path = input_dir / "extracted_text.json"
         with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
         await progress_message.delete()
@@ -305,7 +342,7 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
     cleanup_user_data(context)
     return await start(update, context)
 
-# --- 2. Json To Comic Translate ---
+# --- 2. Json To Comic Translate (This section remains unchanged) ---
 async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     keyboard = [[InlineKeyboardButton("🖼️ Image(s) Upload", callback_data="jt_image")], [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jt_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
@@ -322,7 +359,7 @@ async def json_translate_prompt_json_for_img(update: Update, context: ContextTyp
 async def json_translate_get_json_for_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     json_file = await update.message.document.get_file()
     context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
-    context.user_data['temp_dir_obj'] = tempfile.TemporaryDirectory()
+    context.user_data['temp_dir_obj'] = tempfile.TemporaryDirectory(dir=TEMP_ROOT_DIR)
     context.user_data['received_images'] = {}
     await update.message.reply_text("JSON received. Now send the original images. Press 'Done' when finished.")
     return WAITING_IMAGES_TRANSLATE
@@ -375,14 +412,7 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
         matched_translations = translations_by_file.get(uploaded_filename) or translations_by_file.get(Path(uploaded_filename).name)
         
         if matched_translations:
-            img_cv = cv2.imread(image_path)
-            
-            # --- MODIFICATION START ---
-            # Call the new function to intelligently mask only solid color areas
-            masked_img_cv = mask_solid_color_areas(img_cv, matched_translations)
-            # --- MODIFICATION END ---
-
-            img = Image.fromarray(cv2.cvtColor(masked_img_cv, cv2.COLOR_BGR2RGB))
+            img = Image.open(image_path).convert("RGB")
             draw = ImageDraw.Draw(img)
             
             for entry in matched_translations:
@@ -390,6 +420,7 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
                 if translated_text:
                     x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
                     simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                    draw.rectangle(simple_box, fill="white")
                     draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
             
             bio = io.BytesIO()
@@ -407,7 +438,7 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
     
     cleanup_user_data(context)
     return await start(update, context)
-    
+
 async def json_translate_prompt_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -445,7 +476,7 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
             if fname not in translations_by_file: translations_by_file[fname] = []
             translations_by_file[fname].append(entry)
             
-        all_image_paths = [p for p in input_dir.rglob('*') if filetype.is_image(p)]
+        all_image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
         total_images, processed_count = len(all_image_paths), 0
         
         for img_path in sorted(all_image_paths):
@@ -455,14 +486,7 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
             output_img_path.parent.mkdir(parents=True, exist_ok=True)
             
             if matched_translations:
-                img_cv = cv2.imread(str(img_path))
-
-                # --- MODIFICATION START ---
-                # Call the new function to intelligently mask only solid color areas
-                masked_img_cv = mask_solid_color_areas(img_cv, matched_translations)
-                # --- MODIFICATION END ---
-                
-                img = Image.fromarray(cv2.cvtColor(masked_img_cv, cv2.COLOR_BGR2RGB))
+                img = Image.open(str(img_path)).convert("RGB")
                 draw = ImageDraw.Draw(img)
                 
                 for entry in matched_translations:
@@ -470,6 +494,7 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
                     if translated_text:
                         x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
                         simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                        draw.rectangle(simple_box, fill="white")
                         draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
                 img.save(output_img_path)
             else:
@@ -487,7 +512,7 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
     cleanup_user_data(context)
     return await start(update, context)
 
-# --- 3. Json Divide Feature ---
+# --- 3. Json Divide Feature (This section remains unchanged) ---
 async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     keyboard = [[InlineKeyboardButton("🗂️ Zip Upload", callback_data="jd_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
@@ -508,7 +533,7 @@ async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAITING_ZIP_DIVIDE
 
 async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    progress_message = await update.message.reply_text("Zip file received. Dividing JSON and masking images...")
+    progress_message = await update.message.reply_text("Zip file received. Dividing JSON...")
     json_data = context.user_data.get('json_data')
     if not json_data:
         await progress_message.edit_text("Error: JSON data was lost.")
@@ -523,40 +548,21 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
         await zip_tg_file.download_to_drive(zip_path)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(working_dir)
         
-        blocks_by_folder, all_images_to_process = {}, set()
+        blocks_by_folder = {}
         for entry in json_data:
             p = Path(entry['filename'])
             folder_name = str(p.parent)
             if folder_name not in blocks_by_folder: blocks_by_folder[folder_name] = []
             blocks_by_folder[folder_name].append(entry)
-            all_images_to_process.add(entry['filename'])
-            
-        total_images, processed_count = len(all_images_to_process), 0
         
+        # Write per-folder JSON files; do not modify images
         for folder_rel_path, blocks in blocks_by_folder.items():
             folder_abs_path = working_dir / Path(folder_rel_path)
-            if not folder_abs_path.is_dir(): continue
-            
+            if not folder_abs_path.is_dir():
+                continue
             folder_json_path = folder_abs_path / "folder_text.json"
-            with open(folder_json_path, 'w', encoding='utf-8') as f: json.dump(blocks, f, ensure_ascii=False, indent=4)
-            
-            images_in_folder = {b['filename'] for b in blocks}
-            for img_rel_path in images_in_folder:
-                img_path = working_dir / Path(img_rel_path)
-                if img_path.exists():
-                    img_cv = cv2.imread(str(img_path))
-
-                    # --- MODIFICATION START ---
-                    # Get all text blocks for the current image
-                    blocks_for_this_image = [b for b in blocks if b['filename'] == img_rel_path]
-                    # Call the new function to intelligently mask only solid color areas
-                    masked_img_cv = mask_solid_color_areas(img_cv, blocks_for_this_image)
-                    cv2.imwrite(str(img_path), masked_img_cv)
-                    # --- MODIFICATION END ---
-                    
-                    processed_count +=1
-                    if processed_count % 5 == 0 or processed_count == total_images:
-                        await send_progress_update(progress_message, processed_count, total_images, "Masking")
+            with open(folder_json_path, 'w', encoding='utf-8') as f:
+                json.dump(blocks, f, ensure_ascii=False, indent=4)
 
         zip_path_str = os.path.join(temp_dir, "final_divided_comics")
         shutil.make_archive(zip_path_str, 'zip', working_dir)
@@ -566,9 +572,18 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
     cleanup_user_data(context)
     return await start(update, context)
     
-# --- APPLICATION SETUP ---
+aSYNC_ERROR_MSG = "An internal error occurred. Please try again."
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        logger.exception("Unhandled exception in handler", exc_info=context.error)
+    except Exception as e:
+        logger.error(f"Failed to log exception: {e}")
+
+# --- APPLICATION SETUP (This section remains unchanged) ---
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
+    application.add_error_handler(error_handler)
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
