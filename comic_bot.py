@@ -43,7 +43,7 @@ FONT_PATH = "ComicNeue-Bold.ttf"
 
 # --- GOOGLE VISION API CONFIGURATION ---
 # IMPORTANT: Replace this with the actual path to your downloaded service account JSON file
-GOOGLE_CREDENTIALS_PATH = "path/to/your/service-account-file.json"
+GOOGLE_CREDENTIALS_PATH = "temp.json"
 # ----------------------------------------
 
 # Define the directory where the script is located
