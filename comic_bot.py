@@ -72,7 +72,60 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
 
 # --- HELPER FUNCTIONS ---
 
-# ... (the existing cleanup_user_data and draw_text_in_box functions) ...
+def mask_solid_color_areas(img_cv, blocks_on_image):
+    """
+    Analyzes the area around each text block. If it's a solid color,
+    it fills the text block's bounding box with that color.
+    Otherwise, it leaves the text untouched.
+    """
+    # This threshold determines how "flat" a color needs to be to be considered solid.
+    # Lower is stricter (perfectly flat), higher is more lenient (allows slight gradients).
+    # You can tune this value if needed. A good starting point is 15.
+    COLOR_STD_DEV_THRESHOLD = 15
+    
+    # Define how many pixels to look at around the text box
+    PADDING = 10 
+
+    img_height, img_width = img_cv.shape[:2]
+
+    for entry in blocks_on_image:
+        bbox_points = np.array(entry['bbox'], dtype=np.int32)
+        
+        # Get the bounding rectangle of the text polygon
+        x, y, w, h = cv2.boundingRect(bbox_points)
+
+        # Define a slightly larger "border" area around the text box to analyze
+        # We clamp the values to stay within the image boundaries
+        bx1 = max(0, x - PADDING)
+        by1 = max(0, y - PADDING)
+        bx2 = min(img_width, x + w + PADDING)
+        by2 = min(img_height, y + h + PADDING)
+
+        # Crop the image to this larger border area
+        border_area = img_cv[by1:by2, bx1:bx2]
+        if border_area.size == 0:
+            continue
+
+        # Create a mask to exclude the actual text area from our analysis,
+        # so we only analyze the color of the padding/border.
+        inner_mask = np.zeros(border_area.shape[:2], dtype=np.uint8)
+        # We need to shift the bbox points to be relative to our cropped 'border_area'
+        shifted_bbox = bbox_points - [bx1, by1]
+        cv2.fillPoly(inner_mask, [shifted_bbox], 255)
+        
+        # Calculate the average color and the standard deviation of the color
+        # in the border region ONLY (where the mask is not white)
+        # The standard deviation tells us how much the colors vary.
+        # A low value means it's a very consistent, solid color.
+        mean_color, std_dev = cv2.meanStdDev(border_area, mask=~inner_mask)
+
+        # Check if the color variation is below our threshold
+        if np.mean(std_dev) < COLOR_STD_DEV_THRESHOLD:
+            # It's a solid background! Fill the text polygon with the average color.
+            fill_color = (int(mean_color[0][0]), int(mean_color[1][0]), int(mean_color[2][0]))
+            cv2.fillPoly(img_cv, [bbox_points], fill_color)
+            
+    return img_cv
 
 
 async def send_progress_update(message: Update.message, current: int, total: int, operation: str):
@@ -308,44 +361,53 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
     if not os.path.exists(FONT_PATH):
         await progress_message.edit_text(f"CRITICAL ERROR: Font file '{FONT_PATH}' not found!")
         return await back_to_main_menu(update, context)
+
     images_processed_count = 0
     translations_by_file = {}
     for entry in json_data:
         fname = entry['filename']
         if fname not in translations_by_file: translations_by_file[fname] = []
         translations_by_file[fname].append(entry)
+
     total_images_to_process = len(received_images)
     for i, (uploaded_filename, image_path) in enumerate(received_images.items()):
         await send_progress_update(progress_message, i + 1, total_images_to_process, "Translation")
         matched_translations = translations_by_file.get(uploaded_filename) or translations_by_file.get(Path(uploaded_filename).name)
+        
         if matched_translations:
             img_cv = cv2.imread(image_path)
-            mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
-            for entry in matched_translations:
-                cv2.fillPoly(mask, [np.array(entry['bbox'], dtype=np.int32)], 255)
-            inpainted_img_cv = cv2.inpaint(img_cv, mask, 3, cv2.INPAINT_TELEA)
-            img = Image.fromarray(cv2.cvtColor(inpainted_img_cv, cv2.COLOR_BGR2RGB))
+            
+            # --- MODIFICATION START ---
+            # Call the new function to intelligently mask only solid color areas
+            masked_img_cv = mask_solid_color_areas(img_cv, matched_translations)
+            # --- MODIFICATION END ---
+
+            img = Image.fromarray(cv2.cvtColor(masked_img_cv, cv2.COLOR_BGR2RGB))
             draw = ImageDraw.Draw(img)
+            
             for entry in matched_translations:
                 bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
-                x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
-                simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
                 if translated_text:
+                    x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
+                    simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
                     draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
+            
             bio = io.BytesIO()
             bio.name = f"translated_{uploaded_filename}"
             img.save(bio, 'JPEG')
             bio.seek(0)
             await context.bot.send_document(chat_id=query.message.chat.id, document=bio)
             images_processed_count += 1
+            
     await progress_message.delete()
     if images_processed_count == 0:
         await context.bot.send_message(chat_id=query.message.chat.id, text="Warning: No matching filenames found between your JSON and uploaded images.")
     else:
         await context.bot.send_message(chat_id=query.message.chat.id, text="Translation complete!")
+    
     cleanup_user_data(context)
     return await start(update, context)
-
+    
 async def json_translate_prompt_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -367,33 +429,42 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
     if not os.path.exists(FONT_PATH):
         await progress_message.edit_text(f"CRITICAL ERROR: Font file '{FONT_PATH}' not found!")
         return await back_to_main_menu(update, context)
+
     with tempfile.TemporaryDirectory() as temp_dir:
         input_dir = Path(temp_dir) / "input"; output_dir = Path(temp_dir) / "output"
         input_dir.mkdir(); output_dir.mkdir()
+        
         zip_tg_file = await update.message.document.get_file()
         zip_path = input_dir / "images.zip"
         await zip_tg_file.download_to_drive(zip_path)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
+        
         translations_by_file = {}
         for entry in json_data:
             fname = entry['filename']
             if fname not in translations_by_file: translations_by_file[fname] = []
             translations_by_file[fname].append(entry)
+            
         all_image_paths = [p for p in input_dir.rglob('*') if filetype.is_image(p)]
         total_images, processed_count = len(all_image_paths), 0
+        
         for img_path in sorted(all_image_paths):
             rel_path_str = str(img_path.relative_to(input_dir)).replace('\\', '/')
             matched_translations = translations_by_file.get(rel_path_str)
             output_img_path = output_dir / rel_path_str
             output_img_path.parent.mkdir(parents=True, exist_ok=True)
+            
             if matched_translations:
                 img_cv = cv2.imread(str(img_path))
-                mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
-                for entry in matched_translations:
-                    cv2.fillPoly(mask, [np.array(entry['bbox'], dtype=np.int32)], 255)
-                inpainted_img_cv = cv2.inpaint(img_cv, mask, 3, cv2.INPAINT_TELEA)
-                img = Image.fromarray(cv2.cvtColor(inpainted_img_cv, cv2.COLOR_BGR2RGB))
+
+                # --- MODIFICATION START ---
+                # Call the new function to intelligently mask only solid color areas
+                masked_img_cv = mask_solid_color_areas(img_cv, matched_translations)
+                # --- MODIFICATION END ---
+                
+                img = Image.fromarray(cv2.cvtColor(masked_img_cv, cv2.COLOR_BGR2RGB))
                 draw = ImageDraw.Draw(img)
+                
                 for entry in matched_translations:
                     bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
                     if translated_text:
@@ -403,13 +474,16 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
                 img.save(output_img_path)
             else:
                 shutil.copy(img_path, output_img_path)
+            
             processed_count += 1
             if processed_count % 5 == 0 or processed_count == total_images:
                 await send_progress_update(progress_message, processed_count, total_images, "Translation")
+
         zip_path_str = os.path.join(temp_dir, "final_translated_comics")
         shutil.make_archive(zip_path_str, 'zip', output_dir)
         await progress_message.delete()
         await update.message.reply_document(document=open(f"{zip_path_str}.zip", 'rb'), caption="Processing complete!")
+    
     cleanup_user_data(context)
     return await start(update, context)
 
@@ -439,13 +513,16 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
     if not json_data:
         await progress_message.edit_text("Error: JSON data was lost.")
         return await back_to_main_menu(update, context)
+
     with tempfile.TemporaryDirectory() as temp_dir:
         working_dir = Path(temp_dir) / "work"
         working_dir.mkdir()
+        
         zip_tg_file = await update.message.document.get_file()
         zip_path = working_dir / "images.zip"
         await zip_tg_file.download_to_drive(zip_path)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(working_dir)
+        
         blocks_by_folder, all_images_to_process = {}, set()
         for entry in json_data:
             p = Path(entry['filename'])
@@ -453,33 +530,42 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
             if folder_name not in blocks_by_folder: blocks_by_folder[folder_name] = []
             blocks_by_folder[folder_name].append(entry)
             all_images_to_process.add(entry['filename'])
+            
         total_images, processed_count = len(all_images_to_process), 0
+        
         for folder_rel_path, blocks in blocks_by_folder.items():
             folder_abs_path = working_dir / Path(folder_rel_path)
             if not folder_abs_path.is_dir(): continue
+            
             folder_json_path = folder_abs_path / "folder_text.json"
             with open(folder_json_path, 'w', encoding='utf-8') as f: json.dump(blocks, f, ensure_ascii=False, indent=4)
+            
             images_in_folder = {b['filename'] for b in blocks}
             for img_rel_path in images_in_folder:
                 img_path = working_dir / Path(img_rel_path)
                 if img_path.exists():
                     img_cv = cv2.imread(str(img_path))
-                    mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
-                    boxes_to_mask = [b['bbox'] for b in blocks if b['filename'] == img_rel_path]
-                    for bbox_points in boxes_to_mask:
-                        cv2.fillPoly(mask, [np.array(bbox_points, dtype=np.int32)], 255)
-                    inpainted_img_cv = cv2.inpaint(img_cv, mask, 3, cv2.INPAINT_TELEA)
-                    cv2.imwrite(str(img_path), inpainted_img_cv)
+
+                    # --- MODIFICATION START ---
+                    # Get all text blocks for the current image
+                    blocks_for_this_image = [b for b in blocks if b['filename'] == img_rel_path]
+                    # Call the new function to intelligently mask only solid color areas
+                    masked_img_cv = mask_solid_color_areas(img_cv, blocks_for_this_image)
+                    cv2.imwrite(str(img_path), masked_img_cv)
+                    # --- MODIFICATION END ---
+                    
                     processed_count +=1
                     if processed_count % 5 == 0 or processed_count == total_images:
                         await send_progress_update(progress_message, processed_count, total_images, "Masking")
+
         zip_path_str = os.path.join(temp_dir, "final_divided_comics")
         shutil.make_archive(zip_path_str, 'zip', working_dir)
         await progress_message.delete()
         await update.message.reply_document(document=open(f"{zip_path_str}.zip", 'rb'), caption="Dividing complete!")
+    
     cleanup_user_data(context)
     return await start(update, context)
-
+    
 # --- APPLICATION SETUP ---
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
