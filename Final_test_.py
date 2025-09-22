@@ -486,6 +486,7 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
         zip_path = working_dir / "images.zip"
         await zip_tg_file.download_to_drive(zip_path)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(working_dir)
+        os.remove(zip_path) # <-- THIS IS THE FIX
         
         blocks_by_folder = {}
         for entry in json_data:
