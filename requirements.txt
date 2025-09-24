@@ -1,7 +1,5 @@
-# For CPU
-torch
-torchvision
-torchaudio
-python-telegram-bot
-surya-ocr
-Pillow
+easyocr 
+"python-telegram-bot[ext]" 
+Pillow 
+opencv-python-headless 
+filetype
