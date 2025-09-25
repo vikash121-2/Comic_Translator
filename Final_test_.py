@@ -525,19 +525,19 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
     with tempfile.TemporaryDirectory() as temp_dir:
         working_dir = Path(temp_dir) / "work"
         working_dir.mkdir()
-        # --- MODIFICATION START ---
-        # Replacing the limited PTB download method with Pyrogram's.
+        
+        # --- THIS IS THE CORRECTED DOWNLOAD LOGIC ---
         await progress_message.edit_text("Downloading large file...")
-        # Define the path to save the zip file
+        
         zip_path = working_dir / update.message.document.file_name
-        # Get the Pyrogram client
         pyrogram_client = context.application.bot_data['pyrogram_client']
-        # Use Pyrogram to download the file
+        
+        # Using Pyrogram to handle the large download
         await pyrogram_client.download_media(
             message=update.message.document.file_id,
             file_name=str(zip_path)
         )
-        # --- MODIFICATION END ---
+        # --- END OF CORRECTED LOGIC ---
         
         await progress_message.edit_text("Download complete. Processing...")
         
@@ -551,7 +551,6 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
             if folder_name not in blocks_by_folder: blocks_by_folder[folder_name] = []
             blocks_by_folder[folder_name].append(entry)
         
-        # Write per-folder JSON files
         for folder_rel_path, blocks in blocks_by_folder.items():
             folder_abs_path = working_dir / Path(folder_rel_path)
             if not folder_abs_path.is_dir():
@@ -560,14 +559,12 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
             with open(folder_json_path, 'w', encoding='utf-8') as f:
                 json.dump(blocks, f, ensure_ascii=False, indent=4)
 
-        # Zip the final result for uploading
         zip_path_str = os.path.join(temp_dir, "final_divided_comics")
         shutil.make_archive(zip_path_str, 'zip', working_dir)
         
         final_zip_path = f"{zip_path_str}.zip"
         await progress_message.edit_text("Dividing complete! Now uploading...")
         
-        # Use our existing large file uploader
         await upload_large_file(
             client=pyrogram_client,
             chat_id=update.effective_chat.id,
