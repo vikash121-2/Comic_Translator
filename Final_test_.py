@@ -521,20 +521,37 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
     if not json_data:
         await progress_message.edit_text("Error: JSON data was lost.")
         return await back_to_main_menu(update, context)
+
     with tempfile.TemporaryDirectory() as temp_dir:
         working_dir = Path(temp_dir) / "work"
         working_dir.mkdir()
-        zip_tg_file = await update.message.document.get_file()
-        zip_path = working_dir / "images.zip"
-        await zip_tg_file.download_to_drive(zip_path)
+        # --- MODIFICATION START ---
+        # Replacing the limited PTB download method with Pyrogram's.
+        await progress_message.edit_text("Downloading large file...")
+        # Define the path to save the zip file
+        zip_path = working_dir / update.message.document.file_name
+        # Get the Pyrogram client
+        pyrogram_client = context.application.bot_data['pyrogram_client']
+        # Use Pyrogram to download the file
+        await pyrogram_client.download_media(
+            message=update.message.document.file_id,
+            file_name=str(zip_path)
+        )
+        # --- MODIFICATION END ---
+        
+        await progress_message.edit_text("Download complete. Processing...")
+        
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(working_dir)
         os.remove(zip_path)
+        
         blocks_by_folder = {}
         for entry in json_data:
             p = Path(entry['filename'])
             folder_name = str(p.parent)
             if folder_name not in blocks_by_folder: blocks_by_folder[folder_name] = []
             blocks_by_folder[folder_name].append(entry)
+        
+        # Write per-folder JSON files
         for folder_rel_path, blocks in blocks_by_folder.items():
             folder_abs_path = working_dir / Path(folder_rel_path)
             if not folder_abs_path.is_dir():
@@ -542,11 +559,15 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
             folder_json_path = folder_abs_path / "folder_text.json"
             with open(folder_json_path, 'w', encoding='utf-8') as f:
                 json.dump(blocks, f, ensure_ascii=False, indent=4)
+
+        # Zip the final result for uploading
         zip_path_str = os.path.join(temp_dir, "final_divided_comics")
         shutil.make_archive(zip_path_str, 'zip', working_dir)
+        
         final_zip_path = f"{zip_path_str}.zip"
-        await progress_message.edit_text("Dividing complete! Now uploading the final zip file...")
-        pyrogram_client = context.application.bot_data['pyrogram_client']
+        await progress_message.edit_text("Dividing complete! Now uploading...")
+        
+        # Use our existing large file uploader
         await upload_large_file(
             client=pyrogram_client,
             chat_id=update.effective_chat.id,
@@ -555,6 +576,7 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
             progress_message=progress_message
         )
         await progress_message.delete()
+    
     cleanup_user_data(context)
     return await start(update, context)
 
