@@ -277,19 +277,39 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
     if not ocr_reader:
         await progress_message.edit_text("Error: OCR model could not be loaded.")
         return await back_to_main_menu(update, context)
+
     with tempfile.TemporaryDirectory(dir=TEMP_ROOT_DIR) as temp_dir:
         input_dir = Path(temp_dir)
-        document = update.message.document
-        file_name = document.file_name
-        tg_file = await document.get_file()
-        file_path = input_dir / file_name
-        await tg_file.download_to_drive(file_path)
+        
+        # --- MODIFICATION START ---
+        # The old download method is replaced with Pyrogram's download_media,
+        # which supports files up to 2 GB.
+
+        # Define where to save the file
+        file_path = input_dir / update.message.document.file_name
+        
+        # Get the Pyrogram client from bot_data
+        pyrogram_client = context.application.bot_data['pyrogram_client']
+        
+        await progress_message.edit_text("Downloading large file... this may take a moment.")
+        
+        # Use Pyrogram to download the file attached to the message
+        await pyrogram_client.download_media(
+            message=update.message,
+            file_name=str(file_path)
+        )
+        
+        await progress_message.edit_text("Download complete. Unpacking and processing...")
+        # --- MODIFICATION END ---
+
         with zipfile.ZipFile(file_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
         os.remove(file_path)
+        
         image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
         if not image_paths:
             await progress_message.edit_text("No compatible images found in the zip.")
             return await back_to_main_menu(update, context)
+            
         all_text_data, processed_count, total_images = [], 0, len(image_paths)
         for img_path in sorted(image_paths):
             relative_path = img_path.relative_to(input_dir)
@@ -304,10 +324,12 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
             processed_count += 1
             if processed_count % 5 == 0 or processed_count == total_images:
                 await send_progress_update(progress_message, processed_count, total_images, "Extraction")
+                
         json_path = input_dir / "extracted_text.json"
         with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
         await progress_message.delete()
         await update.message.reply_document(document=open(json_path, 'rb'), caption=f"Extraction complete.")
+        
     cleanup_user_data(context)
     return await start(update, context)
 
