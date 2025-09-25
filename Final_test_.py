@@ -38,22 +38,19 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # <-- IMPORTANT: Replace with your bot token
+BOT_TOKEN = "6298615623:AAEyldSFqE2HT-2vhITBmZ9lQL23C0fu-Ao"  # Your bot token
 FONT_PATH = "ComicNeue-Bold.ttf"
 
-# --- NEW: PYROGRAM API CREDENTIALS ---
-# Get these from my.telegram.org
-API_ID = 17114587 # <-- IMPORTANT: Replace with your API ID
-API_HASH = "b1c07d33747425d84050b68bae6be91f" # <-- IMPORTANT: Replace with your API HASH
+# --- PYROGRAM API CREDENTIALS ---
+API_ID = 17114587  # Your API ID
+API_HASH = "b1c07d33747425d84050b68bae6be91f"  # Your API Hash
 
-# Define the directory where the script is located
+# --- DIRECTORY SETUP ---
 SCRIPT_DIR = Path(__file__).resolve().parent
-# Define a sub-folder to keep all temporary files organized
 TEMP_ROOT_DIR = SCRIPT_DIR / "temp_processing"
-# Create this folder if it doesn't exist
 TEMP_ROOT_DIR.mkdir(exist_ok=True)
 
-# --- CONVERSATION STATES (Unchanged) ---
+# --- CONVERSATION STATES ---
 (
     MAIN_MENU,
     JSON_MAKER_CHOICE, CHOOSE_LANGUAGE, WAITING_IMAGES_OCR, WAITING_ZIP_OCR,
@@ -64,7 +61,7 @@ TEMP_ROOT_DIR.mkdir(exist_ok=True)
     WAITING_JSON_DIVIDE, WAITING_ZIP_DIVIDE
 ) = range(13)
 
-# --- OCR ENGINE SETUP (Unchanged) ---
+# --- OCR ENGINE SETUP ---
 readers = {}
 def get_reader(lang_code):
     global readers
@@ -85,13 +82,7 @@ def cleanup_user_data(context: ContextTypes.DEFAULT_TYPE):
         context.user_data['temp_dir_obj'].cleanup()
     context.user_data.clear()
 
-def mask_solid_color_areas(img_cv, blocks_on_image):
-    """Masking disabled: return image unchanged."""
-    return img_cv
-
-
 async def send_progress_update(message, current: int, total: int, operation: str):
-    """Asynchronously edits a message to show progress."""
     text = f"{operation} in progress... {current}/{total}"
     try:
         if message.text != text:
@@ -100,35 +91,22 @@ async def send_progress_update(message, current: int, total: int, operation: str
         if "Message is not modified" not in str(e):
             logger.warning(f"Could not edit progress message: {e}")
 
-# --- NEW: PYROGRAM UPLOAD HELPER ---
 async def upload_large_file(client: Client, chat_id: int, file_path: str, caption: str, progress_message):
-    """Uploads a large file using Pyrogram and updates the progress message."""
     try:
         async def progress(current, total):
-            # Pyrogram's progress callback gives bytes, so we convert to percentage
             percentage = int(current * 100 / total)
-            # Avoid spamming Telegram APIs by updating only every 5%
             if progress.last_percentage != percentage and percentage % 5 == 0:
                 logger.info(f"Uploading {file_path}: {percentage}%")
                 await progress_message.edit_text(f"Uploading... {percentage}%")
                 progress.last_percentage = percentage
-
-        progress.last_percentage = -1 # Initialize static variable for the callback
-
-        await client.send_document(
-            chat_id=chat_id,
-            document=file_path,
-            caption=caption,
-            progress=progress
-        )
+        progress.last_percentage = -1
+        await client.send_document(chat_id=chat_id, document=file_path, caption=caption, progress=progress)
         logger.info(f"Successfully uploaded {file_path} to {chat_id}")
     except Exception as e:
         logger.error(f"Pyrogram failed to upload {file_path}: {e}")
         await progress_message.edit_text(f"An error occurred during upload: {e}")
 
-
 def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str, max_font_size: int = 60):
-    # This function is unchanged
     box_width, box_height = box[2] - box[0], box[3] - box[1]
     if not text.strip() or box_width <= 10 or box_height <= 10: return
     font_size = max_font_size
@@ -142,24 +120,14 @@ def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str,
         wrap_width = max(1, int(box_width / avg_char_width * 1.8)) if avg_char_width > 0 else 1
         wrapped_text = "\n".join(textwrap.wrap(text, width=wrap_width, break_long_words=True))
         text_bbox = draw.multiline_textbbox((0, 0), wrapped_text, font=font, spacing=4)
-        text_width = text_bbox[2] - text_bbox[0]
-        text_height = text_bbox[3] - text_bbox[1]
+        text_width, text_height = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
         if text_height <= box_height and text_width <= box_width: break
         font_size -= 2
     x, y = box[0] + (box_width - text_width) / 2, box[1] + (box_height - text_height) / 2
     border_color = "white"
-    draw.multiline_text((x-1, y-1), wrapped_text, font=font, fill=border_color, align="center", spacing=4)
-    draw.multiline_text((x+1, y-1), wrapped_text, font=font, fill=border_color, align="center", spacing=4)
-    draw.multiline_text((x-1, y+1), wrapped_text, font=font, fill=border_color, align="center", spacing=4)
-    draw.multiline_text((x+1, y+1), wrapped_text, font=font, fill=border_color, align="center", spacing=4)
+    for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+        draw.multiline_text((x + dx, y + dy), wrapped_text, font=font, fill=border_color, align="center", spacing=4)
     draw.multiline_text((x, y), wrapped_text, font=font, fill="black", align="center", spacing=4)
-
-
-# --- ALL HANDLERS from start() to json_translate_get_json_for_zip() are UNCHANGED ---
-# For brevity, I will omit them. They are exactly as you provided.
-# ...
-# [Paste all your handler functions from 'start' to 'json_translate_get_json_for_zip' here]
-# ...
 
 # --- MAIN MENU & NAVIGATION ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -173,19 +141,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
     elif update.callback_query:
         query = update.callback_query
-        try:
-            await query.answer()
-        except BadRequest:
-            logger.info("Callback query already answered.")
-        try:
-            await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        try: await query.answer()
+        except BadRequest: logger.info("Callback query already answered.")
+        try: await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
         except BadRequest as e:
             logger.info(f"edit_message_text failed in start(): {e}")
             if update.effective_chat:
                 await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=message_text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    chat_id=update.effective_chat.id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard)
                 )
     return MAIN_MENU
 
@@ -250,23 +213,21 @@ async def process_collected_images(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Processing images...")
-    image_paths = context.user_data.get('image_paths', [])
-    lang_code = context.user_data.get('lang_code', 'en')
+    image_paths, lang_code = context.user_data.get('image_paths', []), context.user_data.get('lang_code', 'en')
     ocr_reader = get_reader(lang_code)
     if not ocr_reader:
         await query.edit_message_text("Error: OCR model could not be loaded.")
         return await back_to_main_menu(update, context)
     all_text_data = []
     for img_path in sorted(image_paths):
-        filename = os.path.basename(img_path)
-        img_np = np.array(Image.open(img_path).convert("RGB"))
+        filename, img_np = os.path.basename(img_path), np.array(Image.open(img_path).convert("RGB"))
         results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
         for i, (bbox, text) in enumerate(results):
             text_entry = {"filename": filename, "block_id": i, "bbox": [[int(p[0]), int(p[1])] for p in bbox], "original_text": text, "translated_text": ""}
             all_text_data.append(text_entry)
     json_path = os.path.join(context.user_data['temp_dir_obj'].name, "extracted_text.json")
     with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
-    await context.bot.send_document(chat_id=query.message.chat.id, document=open(json_path, 'rb'), caption=f"Extraction complete.")
+    await context.bot.send_document(chat_id=query.message.chat.id, document=open(json_path, 'rb'), caption="Extraction complete.")
     cleanup_user_data(context)
     return await start(update, context)
 
@@ -277,39 +238,18 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
     if not ocr_reader:
         await progress_message.edit_text("Error: OCR model could not be loaded.")
         return await back_to_main_menu(update, context)
-
     with tempfile.TemporaryDirectory(dir=TEMP_ROOT_DIR) as temp_dir:
-        input_dir = Path(temp_dir)
-        
-        # --- MODIFICATION START ---
-        # The old download method is replaced with Pyrogram's download_media,
-        # which supports files up to 2 GB.
-
-        # Define where to save the file
+        input_dir, pyrogram_client = Path(temp_dir), context.application.bot_data['pyrogram_client']
         file_path = input_dir / update.message.document.file_name
-        
-        # Get the Pyrogram client from bot_data
-        pyrogram_client = context.application.bot_data['pyrogram_client']
-        
         await progress_message.edit_text("Downloading large file... this may take a moment.")
-        
-        # Use Pyrogram to download the file attached to the message
-        await pyrogram_client.download_media(
-            message=update.message.document.file_id,
-            file_name=str(file_path)
-        )
-        
+        await pyrogram_client.download_media(message=update.message.document.file_id, file_name=str(file_path))
         await progress_message.edit_text("Download complete. Unpacking and processing...")
-        # --- MODIFICATION END ---
-
         with zipfile.ZipFile(file_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
         os.remove(file_path)
-        
         image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
         if not image_paths:
             await progress_message.edit_text("No compatible images found in the zip.")
             return await back_to_main_menu(update, context)
-            
         all_text_data, processed_count, total_images = [], 0, len(image_paths)
         for img_path in sorted(image_paths):
             relative_path = img_path.relative_to(input_dir)
@@ -317,19 +257,16 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
                 img_np = np.array(Image.open(img_path).convert("RGB"))
                 results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
                 for i, (bbox, text) in enumerate(results):
-                    text_entry = {"filename": str(relative_path).replace('\\', '/'),"block_id": i, "bbox": [[int(p[0]), int(p[1])] for p in bbox],"original_text": text,"translated_text": ""}
+                    text_entry = {"filename": str(relative_path).replace('\\', '/'), "block_id": i, "bbox": [[int(p[0]), int(p[1])] for p in bbox], "original_text": text, "translated_text": ""}
                     all_text_data.append(text_entry)
-            except Exception as e:
-                logger.error(f"Error processing {relative_path}: {e}")
+            except Exception as e: logger.error(f"Error processing {relative_path}: {e}")
             processed_count += 1
             if processed_count % 5 == 0 or processed_count == total_images:
                 await send_progress_update(progress_message, processed_count, total_images, "Extraction")
-                
         json_path = input_dir / "extracted_text.json"
         with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
         await progress_message.delete()
-        await update.message.reply_document(document=open(json_path, 'rb'), caption=f"Extraction complete.")
-        
+        await update.message.reply_document(document=open(json_path, 'rb'), caption="Extraction complete.")
     cleanup_user_data(context)
     return await start(update, context)
 
@@ -348,7 +285,7 @@ async def json_translate_prompt_json_for_img(update: Update, context: ContextTyp
     return WAITING_JSON_TRANSLATE_IMG
 
 async def json_translate_get_json_for_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    json_file = await update.message.document.get_file()
+    json_file = await update.message.document.get_file() # This is likely OK as JSON files are small, but left for consistency if needed later.
     context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
     context.user_data['temp_dir_obj'] = tempfile.TemporaryDirectory(dir=TEMP_ROOT_DIR)
     context.user_data['received_images'] = {}
@@ -400,12 +337,11 @@ async def json_translate_process_images(update: Update, context: ContextTypes.DE
         await send_progress_update(progress_message, i + 1, total_images_to_process, "Translation")
         matched_translations = translations_by_file.get(uploaded_filename) or translations_by_file.get(Path(uploaded_filename).name)
         if matched_translations:
-            img = Image.open(image_path).convert("RGB")
-            draw = ImageDraw.Draw(img)
+            img, draw = Image.open(image_path).convert("RGB"), ImageDraw.Draw(img)
             for entry in matched_translations:
                 bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
                 if translated_text:
-                    x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
+                    x_coords, y_coords = [p[0] for p in bbox], [p[1] for p in bbox]
                     simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
                     draw.rectangle(simple_box, fill="white")
                     draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
@@ -430,6 +366,7 @@ async def json_translate_prompt_json_for_zip(update: Update, context: ContextTyp
     return WAITING_JSON_TRANSLATE_ZIP
 
 async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # This is OK for now, JSON files are small.
     json_file = await update.message.document.get_file()
     context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
     await update.message.reply_text("JSON file received. Now, please upload the original .zip file.")
@@ -445,11 +382,16 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
         await progress_message.edit_text(f"CRITICAL ERROR: Font file '{FONT_PATH}' not found!")
         return await back_to_main_menu(update, context)
     with tempfile.TemporaryDirectory() as temp_dir:
-        input_dir = Path(temp_dir) / "input"; output_dir = Path(temp_dir) / "output"
+        input_dir, output_dir = Path(temp_dir) / "input", Path(temp_dir) / "output"
         input_dir.mkdir(); output_dir.mkdir()
-        zip_tg_file = await update.message.document.get_file()
-        zip_path = input_dir / "images.zip"
-        await zip_tg_file.download_to_drive(zip_path)
+        
+        # CORRECTED: Use Pyrogram to download large zip file
+        pyrogram_client = context.application.bot_data['pyrogram_client']
+        zip_path = input_dir / update.message.document.file_name
+        await progress_message.edit_text("Downloading large zip file...")
+        await pyrogram_client.download_media(message=update.message.document.file_id, file_name=str(zip_path))
+        await progress_message.edit_text("Download complete. Applying translations...")
+        
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
         translations_by_file = {}
         for entry in json_data:
@@ -460,37 +402,27 @@ async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAU
         total_images, processed_count = len(all_image_paths), 0
         for img_path in sorted(all_image_paths):
             rel_path_str = str(img_path.relative_to(input_dir)).replace('\\', '/')
-            matched_translations = translations_by_file.get(rel_path_str)
-            output_img_path = output_dir / rel_path_str
+            matched_translations, output_img_path = translations_by_file.get(rel_path_str), output_dir / rel_path_str
             output_img_path.parent.mkdir(parents=True, exist_ok=True)
             if matched_translations:
-                img = Image.open(str(img_path)).convert("RGB")
-                draw = ImageDraw.Draw(img)
+                img, draw = Image.open(str(img_path)).convert("RGB"), ImageDraw.Draw(img)
                 for entry in matched_translations:
                     bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
                     if translated_text:
-                        x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
+                        x_coords, y_coords = [p[0] for p in bbox], [p[1] for p in bbox]
                         simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
                         draw.rectangle(simple_box, fill="white")
                         draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
                 img.save(output_img_path)
-            else:
-                shutil.copy(img_path, output_img_path)
+            else: shutil.copy(img_path, output_img_path)
             processed_count += 1
             if processed_count % 5 == 0 or processed_count == total_images:
                 await send_progress_update(progress_message, processed_count, total_images, "Translation")
         zip_path_str = os.path.join(temp_dir, "final_translated_comics")
         shutil.make_archive(zip_path_str, 'zip', output_dir)
         final_zip_path = f"{zip_path_str}.zip"
-        await progress_message.edit_text("Processing complete! Now uploading the final zip file...")
-        pyrogram_client = context.application.bot_data['pyrogram_client']
-        await upload_large_file(
-            client=pyrogram_client,
-            chat_id=update.effective_chat.id,
-            file_path=final_zip_path,
-            caption="Translation complete!",
-            progress_message=progress_message
-        )
+        await progress_message.edit_text("Processing complete! Now uploading...")
+        await upload_large_file(client=pyrogram_client, chat_id=update.effective_chat.id, file_path=final_zip_path, caption="Translation complete!", progress_message=progress_message)
         await progress_message.delete()
     cleanup_user_data(context)
     return await start(update, context)
@@ -510,9 +442,10 @@ async def json_divide_prompt_json(update: Update, context: ContextTypes.DEFAULT_
     return WAITING_JSON_DIVIDE
 
 async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("JSON file received. Now, please upload the original zip file.")
+    # This is OK for now, JSON files are small.
     json_file = await update.message.document.get_file()
     context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
+    await update.message.reply_text("JSON file received. Now, please upload the original zip file.")
     return WAITING_ZIP_DIVIDE
 
 async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -521,248 +454,46 @@ async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_
     if not json_data:
         await progress_message.edit_text("Error: JSON data was lost.")
         return await back_to_main_menu(update, context)
-
     with tempfile.TemporaryDirectory() as temp_dir:
-        working_dir = Path(temp_dir) / "work"
+        working_dir, pyrogram_client = Path(temp_dir) / "work", context.application.bot_data['pyrogram_client']
         working_dir.mkdir()
         
-        # --- THIS IS THE CORRECTED DOWNLOAD LOGIC ---
-        await progress_message.edit_text("Downloading large file...")
-        
+        # CORRECTED: Use Pyrogram to download large zip file
         zip_path = working_dir / update.message.document.file_name
-        pyrogram_client = context.application.bot_data['pyrogram_client']
-        
-        # Using Pyrogram to handle the large download
-        await pyrogram_client.download_media(
-            message=update.message.document.file_id,
-            file_name=str(zip_path)
-        )
-        # --- END OF CORRECTED LOGIC ---
-        
+        await progress_message.edit_text("Downloading large file...")
+        await pyrogram_client.download_media(message=update.message.document.file_id, file_name=str(zip_path))
         await progress_message.edit_text("Download complete. Processing...")
-        
+
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(working_dir)
         os.remove(zip_path)
-        
         blocks_by_folder = {}
         for entry in json_data:
             p = Path(entry['filename'])
             folder_name = str(p.parent)
             if folder_name not in blocks_by_folder: blocks_by_folder[folder_name] = []
             blocks_by_folder[folder_name].append(entry)
-        
         for folder_rel_path, blocks in blocks_by_folder.items():
             folder_abs_path = working_dir / Path(folder_rel_path)
-            if not folder_abs_path.is_dir():
-                continue
+            if not folder_abs_path.is_dir(): continue
             folder_json_path = folder_abs_path / "folder_text.json"
             with open(folder_json_path, 'w', encoding='utf-8') as f:
                 json.dump(blocks, f, ensure_ascii=False, indent=4)
-
         zip_path_str = os.path.join(temp_dir, "final_divided_comics")
         shutil.make_archive(zip_path_str, 'zip', working_dir)
-        
         final_zip_path = f"{zip_path_str}.zip"
         await progress_message.edit_text("Dividing complete! Now uploading...")
-        
-        await upload_large_file(
-            client=pyrogram_client,
-            chat_id=update.effective_chat.id,
-            file_path=final_zip_path,
-            caption="Dividing complete!",
-            progress_message=progress_message
-        )
+        await upload_large_file(client=pyrogram_client, chat_id=update.effective_chat.id, file_path=final_zip_path, caption="Dividing complete!", progress_message=progress_message)
         await progress_message.delete()
-    
     cleanup_user_data(context)
     return await start(update, context)
 
-# --- MODIFIED: json_translate_process_zip ---
-async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    progress_message = await update.message.reply_text("Zip file received. Applying translations...")
-    json_data = context.user_data.get('json_data')
-    if not json_data:
-        await progress_message.edit_text("Error: JSON data was lost.")
-        return await back_to_main_menu(update, context)
-    if not os.path.exists(FONT_PATH):
-        await progress_message.edit_text(f"CRITICAL ERROR: Font file '{FONT_PATH}' not found!")
-        return await back_to_main_menu(update, context)
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        input_dir = Path(temp_dir) / "input"; output_dir = Path(temp_dir) / "output"
-        input_dir.mkdir(); output_dir.mkdir()
-        
-        zip_tg_file = await update.message.document.get_file()
-        zip_path = input_dir / "images.zip"
-        await zip_tg_file.download_to_drive(zip_path)
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
-        
-        translations_by_file = {}
-        for entry in json_data:
-            fname = entry['filename']
-            if fname not in translations_by_file: translations_by_file[fname] = []
-            translations_by_file[fname].append(entry)
-            
-        all_image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
-        total_images, processed_count = len(all_image_paths), 0
-        
-        for img_path in sorted(all_image_paths):
-            rel_path_str = str(img_path.relative_to(input_dir)).replace('\\', '/')
-            matched_translations = translations_by_file.get(rel_path_str)
-            output_img_path = output_dir / rel_path_str
-            output_img_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            if matched_translations:
-                img = Image.open(str(img_path)).convert("RGB")
-                draw = ImageDraw.Draw(img)
-                
-                for entry in matched_translations:
-                    bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
-                    if translated_text:
-                        x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
-                        simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
-                        draw.rectangle(simple_box, fill="white")
-                        draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
-                img.save(output_img_path)
-            else:
-                shutil.copy(img_path, output_img_path)
-            
-            processed_count += 1
-            if processed_count % 5 == 0 or processed_count == total_images:
-                await send_progress_update(progress_message, processed_count, total_images, "Translation")
-
-        zip_path_str = os.path.join(temp_dir, "final_translated_comics")
-        shutil.make_archive(zip_path_str, 'zip', output_dir)
-        
-        final_zip_path = f"{zip_path_str}.zip"
-        await progress_message.edit_text("Processing complete! Now uploading the final zip file...")
-        
-        # --- MODIFICATION: Use Pyrogram for upload ---
-        pyrogram_client = context.application.bot_data['pyrogram_client']
-        await upload_large_file(
-            client=pyrogram_client,
-            chat_id=update.effective_chat.id,
-            file_path=final_zip_path,
-            caption="Translation complete!",
-            progress_message=progress_message
-        )
-        await progress_message.delete()
-    
-    cleanup_user_data(context)
-    return await start(update, context)
-
-# --- json_divide_menu, json_divide_prompt_json, json_divide_get_json are UNCHANGED ---
-# ...
-# [Paste your handler functions 'json_divide_menu', 'json_divide_prompt_json', 'json_divide_get_json' here]
-# ...
-
-# --- MODIFIED: json_divide_process_zip ---
-async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    progress_message = await update.message.reply_text("Zip file received. Dividing JSON...")
-    json_data = context.user_data.get('json_data')
-    if not json_data:
-        await progress_message.edit_text("Error: JSON data was lost.")
-        return await back_to_main_menu(update, context)
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        working_dir = Path(temp_dir) / "work"
-        working_dir.mkdir()
-        
-        zip_tg_file = await update.message.document.get_file()
-        zip_path = working_dir / "images.zip"
-        await zip_tg_file.download_to_drive(zip_path)
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(working_dir)
-        os.remove(zip_path) 
-        
-        blocks_by_folder = {}
-        for entry in json_data:
-            p = Path(entry['filename'])
-            folder_name = str(p.parent)
-            if folder_name not in blocks_by_folder: blocks_by_folder[folder_name] = []
-            blocks_by_folder[folder_name].append(entry)
-        
-        for folder_rel_path, blocks in blocks_by_folder.items():
-            folder_abs_path = working_dir / Path(folder_rel_path)
-            if not folder_abs_path.is_dir():
-                continue
-            folder_json_path = folder_abs_path / "folder_text.json"
-            with open(folder_json_path, 'w', encoding='utf-8') as f:
-                json.dump(blocks, f, ensure_ascii=False, indent=4)
-
-        zip_path_str = os.path.join(temp_dir, "final_divided_comics")
-        shutil.make_archive(zip_path_str, 'zip', working_dir)
-        
-        final_zip_path = f"{zip_path_str}.zip"
-        await progress_message.edit_text("Dividing complete! Now uploading the final zip file...")
-        
-        # --- MODIFICATION: Use Pyrogram for upload ---
-        pyrogram_client = context.application.bot_data['pyrogram_client']
-        await upload_large_file(
-            client=pyrogram_client,
-            chat_id=update.effective_chat.id,
-            file_path=final_zip_path,
-            caption="Dividing complete!",
-            progress_message=progress_message
-        )
-        await progress_message.delete()
-    
-    cleanup_user_data(context)
-    return await start(update, context)
-
-# --- Error handler is UNCHANGED ---
-# ...
-# [Paste your error_handler function here]
-# ...
-
-# --- MODIFIED: APPLICATION SETUP ---
-def main() -> None:
-    """Start the bot."""
-    
-    # --- NEW: Initialize Pyrogram Client ---
-    # The 'bot_session' name can be anything. It's the file where Pyrogram stores its session data.
-    # We use in_memory=True to avoid creating a file, but you can remove it if you want the session to persist.
-    pyrogram_client = Client(
-        "bot_session", 
-        api_id=API_ID, 
-        api_hash=API_HASH, 
-        bot_token=BOT_TOKEN,
-        in_memory=True
-    )
-    
-    # --- MODIFIED: Use Application.builder() to store the client ---
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Store the client instance in bot_data to access it from handlers
-    application.bot_data['pyrogram_client'] = pyrogram_client
-
-    # Register a global error handler
-    application.add_error_handler(error_handler)
-    
-    # --- Conversation Handler is UNCHANGED ---
-    conv_handler = ConversationHandler(
-        # ... Your full ConversationHandler definition here ...
-    )
-    application.add_handler(conv_handler)
-    
-    # --- MODIFIED: Start and stop both frameworks ---
-    logger.info("Starting polling for PTB...")
-    application.run_polling()
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled exception in handler", exc_info=context.error)
 
 async def async_main() -> None:
-    """Initializes and runs the bot and Pyrogram client concurrently."""
-    
-    # --- Initialization ---
-    pyrogram_client = Client(
-        "bot_session",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN
-    )
-    
+    pyrogram_client = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
     application = Application.builder().token(BOT_TOKEN).build()
     application.bot_data['pyrogram_client'] = pyrogram_client
-
-    # Add conversation handler (exactly as you defined it)
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -770,16 +501,14 @@ async def async_main() -> None:
                 CallbackQueryHandler(json_maker_menu, pattern="^main_json_maker$"),
                 CallbackQueryHandler(json_translate_menu, pattern="^main_translate$"),
                 CallbackQueryHandler(json_divide_menu, pattern="^main_divide$"),
-                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"), 
+                CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
             ],
             JSON_MAKER_CHOICE: [
                 CallbackQueryHandler(json_maker_prompt_language, pattern="^jm_image$"),
                 CallbackQueryHandler(json_maker_prompt_language, pattern="^jm_zip$"),
                 CallbackQueryHandler(back_to_main_menu, pattern="^main_menu_start$"),
             ],
-            CHOOSE_LANGUAGE: [
-                CallbackQueryHandler(json_maker_prompt_files, pattern="^lang_"),
-            ],
+            CHOOSE_LANGUAGE: [CallbackQueryHandler(json_maker_prompt_files, pattern="^lang_")],
             WAITING_IMAGES_OCR: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, collect_images),
                 CallbackQueryHandler(process_collected_images, pattern="^process_images$"),
@@ -808,35 +537,14 @@ async def async_main() -> None:
     )
     application.add_error_handler(error_handler)
     application.add_handler(conv_handler)
-    
-    # Run both concurrently
     async with application:
         async with pyrogram_client:
             await application.initialize()
             await application.start()
             await application.updater.start_polling()
             logger.info("PTB application is running.")
-            # Pyrogram is started automatically by the 'async with'
             logger.info("Pyrogram client is running.")
-            # This line is crucial: it keeps the script alive forever
             await asyncio.Future()
 
-aSYNC_ERROR_MSG = "An internal error occurred. Please try again."
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        logger.exception("Unhandled exception in handler", exc_info=context.error)
-    except Exception as e:
-        # Fallback logging
-        logger.error(f"Failed to log exception: {e}")
-    # Do not spam users; optionally inform if desired
-    # if update and hasattr(update, 'effective_chat') and update.effective_chat:
-    #     try:
-    #         await context.bot.send_message(chat_id=update.effective_chat.id, text=aSYNC_ERROR_MSG)
-    #     except Exception:
-    #         pass
-
-# --- APPLICATION SETUP ---
-# You can paste the function above this line
 if __name__ == "__main__":
     asyncio.run(async_main())
