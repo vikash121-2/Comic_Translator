@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFile
 from pathlib import Path
 import numpy as np
 import filetype
+import asyncio
 
 # --- NEW: IMPORT PYROGRAM ---
 from pyrogram import Client
@@ -706,10 +707,10 @@ def main() -> None:
     logger.info("Starting polling for PTB...")
     application.run_polling()
 
-async def async_main():
-    """Asynchronous main function to handle both PTB and Pyrogram."""
+async def async_main() -> None:
+    """Initializes and runs the bot and Pyrogram client concurrently."""
     
-    # Initialize Pyrogram Client
+    # --- Initialization ---
     pyrogram_client = Client(
         "bot_session",
         api_id=API_ID,
@@ -717,14 +718,8 @@ async def async_main():
         bot_token=BOT_TOKEN
     )
     
-    # Initialize PTB Application
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Store the client instance in bot_data
     application.bot_data['pyrogram_client'] = pyrogram_client
-
-    # Add error handler
-    application.add_error_handler(error_handler)
 
     # Add conversation handler (exactly as you defined it)
     conv_handler = ConversationHandler(
@@ -770,16 +765,20 @@ async def async_main():
         },
         fallbacks=[CommandHandler("start", start)],
     )
+    application.add_error_handler(error_handler)
     application.add_handler(conv_handler)
     
     # Run both concurrently
     async with application:
-        await application.start()
-        await application.updater.start_polling()
         async with pyrogram_client:
-            logger.info("Pyrogram client started.")
-            await application.updater.stop()
-            await application.stop()
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling()
+            logger.info("PTB application is running.")
+            # Pyrogram is started automatically by the 'async with'
+            logger.info("Pyrogram client is running.")
+            # This line is crucial: it keeps the script alive forever
+            await asyncio.Future()
 
 aSYNC_ERROR_MSG = "An internal error occurred. Please try again."
 
@@ -798,8 +797,5 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- APPLICATION SETUP ---
 # You can paste the function above this line
-
 if __name__ == "__main__":
-    # --- Use asyncio.run for the new async main ---
-    import asyncio
     asyncio.run(async_main())
