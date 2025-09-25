@@ -295,7 +295,7 @@ async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_T
         
         # Use Pyrogram to download the file attached to the message
         await pyrogram_client.download_media(
-            message=update.message,
+            message=update.message.document.file_id,
             file_name=str(file_path)
         )
         
