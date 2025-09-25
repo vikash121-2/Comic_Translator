@@ -406,6 +406,24 @@ async def async_main():
             await application.updater.stop()
             await application.stop()
 
+aSYNC_ERROR_MSG = "An internal error occurred. Please try again."
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        logger.exception("Unhandled exception in handler", exc_info=context.error)
+    except Exception as e:
+        # Fallback logging
+        logger.error(f"Failed to log exception: {e}")
+    # Do not spam users; optionally inform if desired
+    # if update and hasattr(update, 'effective_chat') and update.effective_chat:
+    #     try:
+    #         await context.bot.send_message(chat_id=update.effective_chat.id, text=aSYNC_ERROR_MSG)
+    #     except Exception:
+    #         pass
+
+# --- APPLICATION SETUP ---
+# You can paste the function above this line
+
 if __name__ == "__main__":
     # --- Use asyncio.run for the new async main ---
     import asyncio
