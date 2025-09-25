@@ -160,6 +160,381 @@ def draw_text_in_box(draw: ImageDraw, box: List[int], text: str, font_path: str,
 # [Paste all your handler functions from 'start' to 'json_translate_get_json_for_zip' here]
 # ...
 
+# --- MAIN MENU & NAVIGATION ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [
+        [InlineKeyboardButton("📝 Json maker", callback_data="main_json_maker")],
+        [InlineKeyboardButton("🎨 json To Comic translate", callback_data="main_translate")],
+        [InlineKeyboardButton("✂️ json divide", callback_data="main_divide")],
+    ]
+    message_text = "Welcome! This is a folder-aware comic translator. Please choose an option:"
+    if update.message:
+        await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif update.callback_query:
+        query = update.callback_query
+        try:
+            await query.answer()
+        except BadRequest:
+            logger.info("Callback query already answered.")
+        try:
+            await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except BadRequest as e:
+            logger.info(f"edit_message_text failed in start(): {e}")
+            if update.effective_chat:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=message_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+    return MAIN_MENU
+
+async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cleanup_user_data(context)
+    return await start(update, context)
+
+# --- 1. Json Maker (Text Extraction) ---
+async def json_maker_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    keyboard = [[InlineKeyboardButton("🖼️ Image(s) Upload", callback_data="jm_image")], [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jm_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
+    await query.answer()
+    await query.edit_message_text("How would you like to provide source files?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return JSON_MAKER_CHOICE
+
+async def json_maker_prompt_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    context.user_data['workflow'] = query.data.split('_')[1]
+    keyboard = [[InlineKeyboardButton("Japanese", callback_data="lang_ja")], [InlineKeyboardButton("Korean", callback_data="lang_ko")], [InlineKeyboardButton("Chinese (Simp)", callback_data="lang_ch_sim"), InlineKeyboardButton("Chinese (Trad)", callback_data="lang_ch_tra")]]
+    await query.answer()
+    await query.edit_message_text("Please select the source language:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_LANGUAGE
+
+async def json_maker_prompt_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    context.user_data['lang_code'] = query.data.split('_', 1)[1]
+    workflow = context.user_data.get('workflow')
+    if workflow == 'image':
+        context.user_data['temp_dir_obj'] = tempfile.TemporaryDirectory()
+        context.user_data['image_paths'] = []
+        await query.answer()
+        await query.edit_message_text("Language selected. Please send your images. Press 'Done' when finished.")
+        return WAITING_IMAGES_OCR
+    elif workflow == 'zip':
+        await query.answer()
+        await query.edit_message_text("Language selected. Now, please send your single .zip file.")
+        return WAITING_ZIP_OCR
+
+async def collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        temp_dir_path = context.user_data['temp_dir_obj'].name
+        image_paths = context.user_data['image_paths']
+    except KeyError:
+        await update.message.reply_text("Something went wrong. Please start over.")
+        return ConversationHandler.END
+    file_to_download, file_name = (None, None)
+    if update.message.photo:
+        file_to_download = await update.message.photo[-1].get_file()
+        file_name = f"{file_to_download.file_id}.jpg"
+    elif update.message.document and update.message.document.mime_type.startswith('image/'):
+        file_to_download = await update.message.document.get_file()
+        file_name = update.message.document.file_name
+    else: return WAITING_IMAGES_OCR
+    file_path = os.path.join(temp_dir_path, file_name)
+    await file_to_download.download_to_drive(file_path)
+    image_paths.append(file_path)
+    keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="process_images")]]
+    await update.message.reply_text(f"Image {len(image_paths)} received. Send another, or press Done.", reply_markup=InlineKeyboardMarkup(keyboard))
+    return WAITING_IMAGES_OCR
+
+async def process_collected_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Processing images...")
+    image_paths = context.user_data.get('image_paths', [])
+    lang_code = context.user_data.get('lang_code', 'en')
+    ocr_reader = get_reader(lang_code)
+    if not ocr_reader:
+        await query.edit_message_text("Error: OCR model could not be loaded.")
+        return await back_to_main_menu(update, context)
+    all_text_data = []
+    for img_path in sorted(image_paths):
+        filename = os.path.basename(img_path)
+        img_np = np.array(Image.open(img_path).convert("RGB"))
+        results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
+        for i, (bbox, text) in enumerate(results):
+            text_entry = {"filename": filename, "block_id": i, "bbox": [[int(p[0]), int(p[1])] for p in bbox], "original_text": text, "translated_text": ""}
+            all_text_data.append(text_entry)
+    json_path = os.path.join(context.user_data['temp_dir_obj'].name, "extracted_text.json")
+    with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
+    await context.bot.send_document(chat_id=query.message.chat.id, document=open(json_path, 'rb'), caption=f"Extraction complete.")
+    cleanup_user_data(context)
+    return await start(update, context)
+
+async def json_maker_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    progress_message = await update.message.reply_text("Zip received. Unpacking and processing...")
+    lang_code = context.user_data.get('lang_code', 'en')
+    ocr_reader = get_reader(lang_code)
+    if not ocr_reader:
+        await progress_message.edit_text("Error: OCR model could not be loaded.")
+        return await back_to_main_menu(update, context)
+    with tempfile.TemporaryDirectory(dir=TEMP_ROOT_DIR) as temp_dir:
+        input_dir = Path(temp_dir)
+        document = update.message.document
+        file_name = document.file_name
+        tg_file = await document.get_file()
+        file_path = input_dir / file_name
+        await tg_file.download_to_drive(file_path)
+        with zipfile.ZipFile(file_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
+        os.remove(file_path)
+        image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
+        if not image_paths:
+            await progress_message.edit_text("No compatible images found in the zip.")
+            return await back_to_main_menu(update, context)
+        all_text_data, processed_count, total_images = [], 0, len(image_paths)
+        for img_path in sorted(image_paths):
+            relative_path = img_path.relative_to(input_dir)
+            try:
+                img_np = np.array(Image.open(img_path).convert("RGB"))
+                results = ocr_reader.readtext(img_np, paragraph=True, mag_ratio=1.5, text_threshold=0.4)
+                for i, (bbox, text) in enumerate(results):
+                    text_entry = {"filename": str(relative_path).replace('\\', '/'),"block_id": i, "bbox": [[int(p[0]), int(p[1])] for p in bbox],"original_text": text,"translated_text": ""}
+                    all_text_data.append(text_entry)
+            except Exception as e:
+                logger.error(f"Error processing {relative_path}: {e}")
+            processed_count += 1
+            if processed_count % 5 == 0 or processed_count == total_images:
+                await send_progress_update(progress_message, processed_count, total_images, "Extraction")
+        json_path = input_dir / "extracted_text.json"
+        with open(json_path, 'w', encoding='utf-8') as f: json.dump(all_text_data, f, ensure_ascii=False, indent=4)
+        await progress_message.delete()
+        await update.message.reply_document(document=open(json_path, 'rb'), caption=f"Extraction complete.")
+    cleanup_user_data(context)
+    return await start(update, context)
+
+# --- 2. Json To Comic Translate ---
+async def json_translate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    keyboard = [[InlineKeyboardButton("🖼️ Image(s) Upload", callback_data="jt_image")], [InlineKeyboardButton("🗂️ Zip Upload", callback_data="jt_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
+    await query.answer()
+    await query.edit_message_text("How would you like to apply translations?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return JSON_TRANSLATE_CHOICE
+
+async def json_translate_prompt_json_for_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("First, please upload the translated JSON file.")
+    return WAITING_JSON_TRANSLATE_IMG
+
+async def json_translate_get_json_for_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    json_file = await update.message.document.get_file()
+    context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
+    context.user_data['temp_dir_obj'] = tempfile.TemporaryDirectory(dir=TEMP_ROOT_DIR)
+    context.user_data['received_images'] = {}
+    await update.message.reply_text("JSON received. Now send the original images. Press 'Done' when finished.")
+    return WAITING_IMAGES_TRANSLATE
+
+async def json_translate_collect_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        temp_dir_path = context.user_data['temp_dir_obj'].name
+        received_images = context.user_data['received_images']
+    except KeyError:
+        await update.message.reply_text("Something went wrong. Please start over.")
+        return ConversationHandler.END
+    file_to_download, original_filename = (None, None)
+    if update.message.photo:
+        file_to_download = await update.message.photo[-1].get_file()
+        original_filename = f"photo_{file_to_download.file_id}.jpg"
+    elif update.message.document and update.message.document.mime_type.startswith('image/'):
+        file_to_download = await update.message.document.get_file()
+        original_filename = update.message.document.file_name
+    else: return WAITING_IMAGES_TRANSLATE
+    file_path = os.path.join(temp_dir_path, original_filename)
+    await file_to_download.download_to_drive(file_path)
+    received_images[original_filename] = file_path
+    keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="jt_process_images")]]
+    await update.message.reply_text(f"Image '{original_filename}' received. Send another, or press Done.", reply_markup=InlineKeyboardMarkup(keyboard))
+    return WAITING_IMAGES_TRANSLATE
+
+async def json_translate_process_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    progress_message = await query.edit_message_text("Applying translations to images...")
+    json_data = context.user_data.get('json_data', [])
+    received_images = context.user_data.get('received_images', {})
+    if not received_images:
+        await progress_message.edit_text("You didn't send any images! Please start over.")
+        return await back_to_main_menu(update, context)
+    if not os.path.exists(FONT_PATH):
+        await progress_message.edit_text(f"CRITICAL ERROR: Font file '{FONT_PATH}' not found!")
+        return await back_to_main_menu(update, context)
+    images_processed_count = 0
+    translations_by_file = {}
+    for entry in json_data:
+        fname = entry['filename']
+        if fname not in translations_by_file: translations_by_file[fname] = []
+        translations_by_file[fname].append(entry)
+    total_images_to_process = len(received_images)
+    for i, (uploaded_filename, image_path) in enumerate(received_images.items()):
+        await send_progress_update(progress_message, i + 1, total_images_to_process, "Translation")
+        matched_translations = translations_by_file.get(uploaded_filename) or translations_by_file.get(Path(uploaded_filename).name)
+        if matched_translations:
+            img = Image.open(image_path).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            for entry in matched_translations:
+                bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
+                if translated_text:
+                    x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
+                    simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                    draw.rectangle(simple_box, fill="white")
+                    draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
+            bio = io.BytesIO()
+            bio.name = f"translated_{uploaded_filename}"
+            img.save(bio, 'JPEG')
+            bio.seek(0)
+            await context.bot.send_document(chat_id=query.message.chat.id, document=bio)
+            images_processed_count += 1
+    await progress_message.delete()
+    if images_processed_count == 0:
+        await context.bot.send_message(chat_id=query.message.chat.id, text="Warning: No matching filenames found between your JSON and uploaded images.")
+    else:
+        await context.bot.send_message(chat_id=query.message.chat.id, text="Translation complete!")
+    cleanup_user_data(context)
+    return await start(update, context)
+
+async def json_translate_prompt_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Please upload the translated JSON file.")
+    return WAITING_JSON_TRANSLATE_ZIP
+
+async def json_translate_get_json_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    json_file = await update.message.document.get_file()
+    context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
+    await update.message.reply_text("JSON file received. Now, please upload the original .zip file.")
+    return WAITING_ZIP_TRANSLATE
+
+async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    progress_message = await update.message.reply_text("Zip file received. Applying translations...")
+    json_data = context.user_data.get('json_data')
+    if not json_data:
+        await progress_message.edit_text("Error: JSON data was lost.")
+        return await back_to_main_menu(update, context)
+    if not os.path.exists(FONT_PATH):
+        await progress_message.edit_text(f"CRITICAL ERROR: Font file '{FONT_PATH}' not found!")
+        return await back_to_main_menu(update, context)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_dir = Path(temp_dir) / "input"; output_dir = Path(temp_dir) / "output"
+        input_dir.mkdir(); output_dir.mkdir()
+        zip_tg_file = await update.message.document.get_file()
+        zip_path = input_dir / "images.zip"
+        await zip_tg_file.download_to_drive(zip_path)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(input_dir)
+        translations_by_file = {}
+        for entry in json_data:
+            fname = entry['filename']
+            if fname not in translations_by_file: translations_by_file[fname] = []
+            translations_by_file[fname].append(entry)
+        all_image_paths = [p for p in input_dir.rglob('*') if p.is_file() and filetype.is_image(p)]
+        total_images, processed_count = len(all_image_paths), 0
+        for img_path in sorted(all_image_paths):
+            rel_path_str = str(img_path.relative_to(input_dir)).replace('\\', '/')
+            matched_translations = translations_by_file.get(rel_path_str)
+            output_img_path = output_dir / rel_path_str
+            output_img_path.parent.mkdir(parents=True, exist_ok=True)
+            if matched_translations:
+                img = Image.open(str(img_path)).convert("RGB")
+                draw = ImageDraw.Draw(img)
+                for entry in matched_translations:
+                    bbox, translated_text = entry['bbox'], entry.get('translated_text', '').strip()
+                    if translated_text:
+                        x_coords = [p[0] for p in bbox]; y_coords = [p[1] for p in bbox]
+                        simple_box = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                        draw.rectangle(simple_box, fill="white")
+                        draw_text_in_box(draw, simple_box, translated_text, FONT_PATH)
+                img.save(output_img_path)
+            else:
+                shutil.copy(img_path, output_img_path)
+            processed_count += 1
+            if processed_count % 5 == 0 or processed_count == total_images:
+                await send_progress_update(progress_message, processed_count, total_images, "Translation")
+        zip_path_str = os.path.join(temp_dir, "final_translated_comics")
+        shutil.make_archive(zip_path_str, 'zip', output_dir)
+        final_zip_path = f"{zip_path_str}.zip"
+        await progress_message.edit_text("Processing complete! Now uploading the final zip file...")
+        pyrogram_client = context.application.bot_data['pyrogram_client']
+        await upload_large_file(
+            client=pyrogram_client,
+            chat_id=update.effective_chat.id,
+            file_path=final_zip_path,
+            caption="Translation complete!",
+            progress_message=progress_message
+        )
+        await progress_message.delete()
+    cleanup_user_data(context)
+    return await start(update, context)
+
+# --- 3. Json Divide Feature ---
+async def json_divide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    keyboard = [[InlineKeyboardButton("🗂️ Zip Upload", callback_data="jd_zip")], [InlineKeyboardButton("« Back", callback_data="main_menu_start")]]
+    await query.answer()
+    await query.edit_message_text("This feature requires a master JSON and a zip file.\nPlease upload the master JSON file first.", reply_markup=InlineKeyboardMarkup(keyboard))
+    return JSON_DIVIDE_CHOICE
+
+async def json_divide_prompt_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Please upload the master JSON file.")
+    return WAITING_JSON_DIVIDE
+
+async def json_divide_get_json(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("JSON file received. Now, please upload the original zip file.")
+    json_file = await update.message.document.get_file()
+    context.user_data['json_data'] = json.loads(await json_file.download_as_bytearray())
+    return WAITING_ZIP_DIVIDE
+
+async def json_divide_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    progress_message = await update.message.reply_text("Zip file received. Dividing JSON...")
+    json_data = context.user_data.get('json_data')
+    if not json_data:
+        await progress_message.edit_text("Error: JSON data was lost.")
+        return await back_to_main_menu(update, context)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        working_dir = Path(temp_dir) / "work"
+        working_dir.mkdir()
+        zip_tg_file = await update.message.document.get_file()
+        zip_path = working_dir / "images.zip"
+        await zip_tg_file.download_to_drive(zip_path)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(working_dir)
+        os.remove(zip_path)
+        blocks_by_folder = {}
+        for entry in json_data:
+            p = Path(entry['filename'])
+            folder_name = str(p.parent)
+            if folder_name not in blocks_by_folder: blocks_by_folder[folder_name] = []
+            blocks_by_folder[folder_name].append(entry)
+        for folder_rel_path, blocks in blocks_by_folder.items():
+            folder_abs_path = working_dir / Path(folder_rel_path)
+            if not folder_abs_path.is_dir():
+                continue
+            folder_json_path = folder_abs_path / "folder_text.json"
+            with open(folder_json_path, 'w', encoding='utf-8') as f:
+                json.dump(blocks, f, ensure_ascii=False, indent=4)
+        zip_path_str = os.path.join(temp_dir, "final_divided_comics")
+        shutil.make_archive(zip_path_str, 'zip', working_dir)
+        final_zip_path = f"{zip_path_str}.zip"
+        await progress_message.edit_text("Dividing complete! Now uploading the final zip file...")
+        pyrogram_client = context.application.bot_data['pyrogram_client']
+        await upload_large_file(
+            client=pyrogram_client,
+            chat_id=update.effective_chat.id,
+            file_path=final_zip_path,
+            caption="Dividing complete!",
+            progress_message=progress_message
+        )
+        await progress_message.delete()
+    cleanup_user_data(context)
+    return await start(update, context)
+
 # --- MODIFIED: json_translate_process_zip ---
 async def json_translate_process_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     progress_message = await update.message.reply_text("Zip file received. Applying translations...")
